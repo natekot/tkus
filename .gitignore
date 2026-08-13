@@ -1,0 +1,10 @@
+__pycache__/
+*.pyc
+build/
+dist/
+*.egg-info/
+
+# Local agent data dumps -- contain prompts, responses, and source from private repos
+copilot.zip
+*.zip
+.copilot/

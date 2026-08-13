@@ -1,0 +1,23 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "tkus"
+version = "0.1.0"
+description = "Attribute AI agent token usage and cost to individual git commits."
+readme = "README.md"
+requires-python = ">=3.8"
+license = { text = "MIT" }
+# No runtime dependencies: the hook runs on every commit, so it must not drag
+# in an import graph that can break independently of the tool.
+dependencies = []
+
+[project.scripts]
+tkus = "tkus.__main__:main"
+
+[tool.setuptools]
+packages = ["tkus", "tkus.providers"]
+
+[tool.setuptools.package-data]
+tkus = ["rates.json"]
