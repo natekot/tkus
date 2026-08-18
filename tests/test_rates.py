@@ -67,12 +67,14 @@ class TestRateRows(unittest.TestCase):
         self.assertIsNone(_row(rows, "claude-haiku-4-5", "fast"))
 
     def test_rates_follow_the_date(self):
+        """Every current rate is flat, so the same date logic must return the
+        same numbers rather than silently stepping."""
         before = _row(_rate_rows(self.table, AUGUST), "claude-sonnet-5")
         after = _row(_rate_rows(self.table, SEPTEMBER), "claude-sonnet-5")
-        self.assertEqual(before["input"], 2.0)     # introductory
-        self.assertEqual(after["input"], 3.0)
+        self.assertEqual(before["input"], 2.0)
+        self.assertEqual(after["input"], 2.0)
         self.assertEqual(before["cache_read"], 0.2)
-        self.assertEqual(after["cache_read"], 0.3)
+        self.assertEqual(after["cache_read"], 0.2)
 
 
 class TestScheduledChanges(unittest.TestCase):
@@ -80,12 +82,25 @@ class TestScheduledChanges(unittest.TestCase):
         self.table = RateTable.load()
 
     def test_a_future_increase_is_surfaced(self):
-        """A price rise that arrives silently is the failure mode worth avoiding."""
-        changes = _scheduled_changes(self.table, AUGUST)
-        sonnet = [c for c in changes if c["model"] == "claude-sonnet-5"]
-        self.assertEqual(len(sonnet), 1)
-        self.assertEqual(sonnet[0]["from"], "2026-09-01")
-        self.assertEqual((sonnet[0]["from_input"], sonnet[0]["input"]), (2.0, 3.0))
+        """A price rise that arrives silently is the failure mode worth avoiding.
+
+        Exercised on a synthetic table: the bundled one currently schedules no
+        increases, since Sonnet 5's was cancelled.
+        """
+        table = RateTable({
+            "version": "test", "currency": "USD",
+            "models": {"claude-x": {"standard": [
+                {"from": None, "until": "2026-08-31", "input": 2.0, "output": 10.0},
+                {"from": "2026-09-01", "until": None, "input": 3.0, "output": 15.0},
+            ]}},
+        })
+        changes = _scheduled_changes(table, AUGUST)
+        self.assertEqual(len(changes), 1)
+        self.assertEqual(changes[0]["from"], "2026-09-01")
+        self.assertEqual((changes[0]["from_input"], changes[0]["input"]), (2.0, 3.0))
+
+    def test_the_bundled_table_schedules_no_increase(self):
+        self.assertEqual(_scheduled_changes(self.table, AUGUST), [])
 
     def test_nothing_scheduled_once_it_has_taken_effect(self):
         changes = _scheduled_changes(self.table, SEPTEMBER)

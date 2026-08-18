@@ -469,6 +469,10 @@ def _rate_drift(table, data, when):
                     # would discard information rather than refresh it.
                     "dated": bool(window.get("until") or window.get("from")),
                     "until": window.get("until"),
+                    # A pinned rate has been checked against published pricing,
+                    # which outranks the catalog: Claude Code's own table can be
+                    # stale (it still carries Sonnet 5's cancelled increase).
+                    "pinned": window.get("pinned") or None,
                 })
     known = set(table.data.get("aliases", {}))
     alias_gaps = {dated: canonical
@@ -491,8 +495,13 @@ def _print_drift(drift, data, table) -> None:
         print(header)
         print("-" * len(header))
         for c in changed:
-            note = "  [dated window%s]" % (
-                " ending %s" % c["until"] if c["until"] else "") if c["dated"] else ""
+            if c["pinned"]:
+                note = "  [pinned]"
+            elif c["dated"]:
+                note = "  [dated window%s]" % (
+                    " ending %s" % c["until"] if c["until"] else "")
+            else:
+                note = ""
             print("%-*s %-7s %12s -> %-12s%s" % (
                 width, c["model"], c["field"], _money(c["bundled"]),
                 _money(c["upstream"]), note))
@@ -517,7 +526,11 @@ def _print_drift(drift, data, table) -> None:
             print("  %s -> %s" % (dated, canonical))
         print()
 
-    dated = [c for c in changed if c["dated"]]
+    for change in changed:
+        if change["pinned"]:
+            print("pinned: %s %s -- %s"
+                  % (change["model"], change["field"], change["pinned"]))
+    dated = [c for c in changed if c["dated"] and not c["pinned"]]
     if dated:
         print("%d change(s) fall inside a dated window and are not "
               "auto-resolvable: the catalog carries no dates, so it cannot "
@@ -569,6 +582,10 @@ def _build_update(table, data, drift, when, existing):
     for name, changes in by_model.items():
         if name in existing_models:
             skipped.append((name, "already overridden locally"))
+            continue
+        pinned = next((c["pinned"] for c in changes if c["pinned"]), None)
+        if pinned:
+            skipped.append((name, "pinned to published pricing"))
             continue
         if any(c["dated"] for c in changes):
             skipped.append((name, "inside a dated window the catalog cannot express"))

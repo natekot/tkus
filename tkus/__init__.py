@@ -7,4 +7,4 @@
 # Bump this on every deployed change. pip compares *packaged* versions, so a
 # stale number here makes `pip install --upgrade` a silent no-op on machines
 # that already have tkus.
-__version__ = "0.5.0"
+__version__ = "0.6.0"

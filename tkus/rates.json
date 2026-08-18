@@ -56,9 +56,8 @@
     },
     "claude-sonnet-5": {
       "standard": [
-        {"from": null, "until": "2026-08-31", "input": 2.0, "output": 10.0,
-         "note": "introductory pricing"},
-        {"from": "2026-09-01", "until": null, "input": 3.0, "output": 15.0}
+        { "from": null, "until": null, "input": 2.0, "output": 10.0,
+          "pinned": "The $2/$10 launch price is now the standard price. The increase to $3/$15 scheduled for 2026-09-01 was cancelled; Claude Code's catalog still reports the old tier, so do not auto-update this from it." }
       ]
     },
     "claude-sonnet-4-6": {

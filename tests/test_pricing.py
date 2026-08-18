@@ -61,42 +61,74 @@ class TestCachePricing(unittest.TestCase):
 
 
 class TestDateRangedRates(unittest.TestCase):
-    def setUp(self):
-        self.table = RateTable.load(None)
+    """The mechanism, exercised on a synthetic table.
 
-    def test_sonnet_5_introductory_price_before_september(self):
+    It used to be tested through claude-sonnet-5, whose introductory pricing was
+    scheduled to end 2026-08-31. That increase was cancelled, so the real table
+    no longer has a dated window -- but date-ranging still has to work, because
+    it is what keeps an old commit priced at the rates that applied to it.
+    """
+
+    def setUp(self):
+        self.table = RateTable({
+            "version": "test", "currency": "USD",
+            "multipliers": {"cache_write_1h": 2.0, "cache_write_5m": 1.25,
+                            "cache_read": 0.1},
+            "models": {"claude-opus-5": {"standard": [
+                {"from": None, "until": "2026-08-31", "input": 2.0, "output": 10.0},
+                {"from": "2026-09-01", "until": None, "input": 3.0, "output": 15.0},
+            ]}},
+        })
+
+    def test_price_before_the_change(self):
         cost = compute_cost(
-            [record(model="claude-sonnet-5", input_tokens=MTOK,
-                    timestamp=at("2026-08-15"))],
-            self.table,
-        )
+            [record(model="claude-opus-5", input_tokens=MTOK,
+                    timestamp=at("2026-08-15"))], self.table)
         self.assertAlmostEqual(cost.total, 2.0, places=6)
 
-    def test_sonnet_5_steps_up_on_2026_09_01(self):
-        """Introductory pricing ends 2026-08-31. A commit dated after that
-        must price at the standard rate with no code change."""
+    def test_price_after_the_change(self):
         cost = compute_cost(
-            [record(model="claude-sonnet-5", input_tokens=MTOK,
-                    timestamp=at("2026-09-15"))],
-            self.table,
-        )
+            [record(model="claude-opus-5", input_tokens=MTOK,
+                    timestamp=at("2026-09-15"))], self.table)
         self.assertAlmostEqual(cost.total, 3.0, places=6)
 
     def test_boundary_days(self):
-        table = self.table
-        self.assertEqual(table.rate_for("claude-sonnet-5", "standard", at("2026-08-31")),
-                         (2.0, 10.0))
-        self.assertEqual(table.rate_for("claude-sonnet-5", "standard", at("2026-09-01")),
-                         (3.0, 15.0))
+        self.assertEqual(
+            self.table.rate_for("claude-opus-5", "standard", at("2026-08-31")),
+            (2.0, 10.0))
+        self.assertEqual(
+            self.table.rate_for("claude-opus-5", "standard", at("2026-09-01")),
+            (3.0, 15.0))
 
     def test_commit_is_priced_at_its_own_date(self):
         """Old commits keep their original cost when the table moves on."""
-        old = compute_cost([record(model="claude-sonnet-5", output_tokens=MTOK,
+        old = compute_cost([record(model="claude-opus-5", output_tokens=MTOK,
                                    timestamp=at("2026-08-01"))], self.table)
-        new = compute_cost([record(model="claude-sonnet-5", output_tokens=MTOK,
+        new = compute_cost([record(model="claude-opus-5", output_tokens=MTOK,
                                    timestamp=at("2026-10-01"))], self.table)
         self.assertAlmostEqual(old.total, 10.0, places=6)
         self.assertAlmostEqual(new.total, 15.0, places=6)
+
+
+class TestSonnet5PriceIsFlat(unittest.TestCase):
+    """The $2/$10 launch price became the standard price; the increase to
+    $3/$15 scheduled for 2026-09-01 was cancelled. tkus carried the schedule,
+    so without this it would have started overcharging by 50% on that date."""
+
+    def setUp(self):
+        self.table = RateTable.load(None)
+
+    def test_same_price_on_both_sides_of_the_cancelled_date(self):
+        for day in ("2026-08-31", "2026-09-01", "2027-06-01"):
+            self.assertEqual(
+                self.table.rate_for("claude-sonnet-5", "standard", at(day)),
+                (2.0, 10.0), "wrong on %s" % day)
+
+    def test_a_commit_after_the_cancelled_date_is_not_overcharged(self):
+        cost = compute_cost(
+            [record(model="claude-sonnet-5", input_tokens=MTOK,
+                    timestamp=at("2026-09-15"))], self.table)
+        self.assertAlmostEqual(cost.total, 2.0, places=6)
 
 
 class TestModifiers(unittest.TestCase):

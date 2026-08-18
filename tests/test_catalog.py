@@ -221,8 +221,8 @@ class TestAgainstTheRealBinary(unittest.TestCase):
         drift = _rate_drift(RateTable.load(), data,
                             datetime.now(timezone.utc))
         self.assertEqual(drift["missing"], [], "models absent from rates.json")
-        undated = [c for c in drift["changed"] if not c["dated"]]
-        self.assertEqual(undated, [], "undated price drift in rates.json")
+        loose = [c for c in drift["changed"] if not c["dated"] and not c["pinned"]]
+        self.assertEqual(loose, [], "unexplained price drift in rates.json")
 
 
 class TestRatesCheckCommand(unittest.TestCase):
@@ -344,12 +344,24 @@ class TestRatesUpdate(unittest.TestCase):
             self.written()["models"]["claude-alpha-1"]["standard"][0]["input"], 0.5)
 
     def test_a_dated_window_is_left_alone(self):
-        """claude-sonnet-5 carries introductory pricing the catalog cannot see."""
-        models = MODELS + [("claude-sonnet-5", "tier_b", None)]
-        code, text = self.run_update("--yes", models=models)
-        self.assertIn("left alone: claude-sonnet-5", text)
+        """A window with dates says something the catalog cannot: it carries no
+        date dimension, so it cannot tell a price change from a promotion."""
+        repo = os.path.join(self.tmp, "repo")
+        os.makedirs(repo)
+        subprocess.run(["git", "init", "-q"], cwd=repo, check=True)
+        with open(os.path.join(repo, ".tkus.json"), "w") as fh:
+            json.dump({"models": {"claude-alpha-1": {"standard": [
+                {"from": None, "until": "2026-12-31", "input": 99.0,
+                 "output": 99.0}]}}}, fh)
+        path = write_blob(self.tmp)
+        out = subprocess.run(
+            [sys.executable, "-m", "tkus", "rates", "--update", "--yes"],
+            cwd=repo, env=dict(self.env, TKUS_CLAUDE_BINARY=path),
+            stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+        text = out.stdout.decode()
+        self.assertIn("left alone: claude-alpha-1", text)
         self.assertIn("dated window", text)
-        self.assertNotIn("claude-sonnet-5", self.written().get("models", {}))
+        self.assertNotIn("claude-alpha-1", self.written().get("models", {}))
 
     def test_a_changed_undated_model_closes_its_window_rather_than_editing_it(self):
         """The reprice guarantee: history keeps the rates that applied to it."""
@@ -406,3 +418,69 @@ class TestRatesUpdate(unittest.TestCase):
         self.assertEqual(out.returncode, 0)
         self.assertIn("could not read", out.stdout.decode())
         self.assertFalse(os.path.exists(self.override))
+
+
+class TestPinnedRates(unittest.TestCase):
+    """A pinned rate outranks the catalog.
+
+    Claude Code's table is a convenience, not an authority: 2.1.227 still
+    carries Sonnet 5's cancelled increase to 3/15. Where a rate has been checked
+    against published pricing, `--check` must still report the disagreement --
+    it is a real signal -- but `--update` must never write the catalog's value.
+    """
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp()
+        self.config = os.path.join(self.tmp, "config")
+        self.env = dict(os.environ, PYTHONPATH=PROJECT,
+                        XDG_CONFIG_HOME=self.config)
+        self.override = os.path.join(self.config, "tkus", "rates.json")
+        self.blob = write_blob(
+            self.tmp, models=MODELS + [("claude-sonnet-5", "tier_b", None)])
+
+    def tearDown(self):
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def run_rates(self, *args):
+        out = subprocess.run(
+            [sys.executable, "-m", "tkus", "rates"] + list(args),
+            cwd=self.tmp, env=dict(self.env, TKUS_CLAUDE_BINARY=self.blob),
+            stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+        return out.returncode, out.stdout.decode()
+
+    def test_check_reports_a_pinned_disagreement(self):
+        code, text = self.run_rates("--check")
+        self.assertEqual(code, 1)
+        self.assertIn("[pinned]", text)
+        self.assertIn("cancelled", text)
+
+    def test_update_refuses_to_overwrite_a_pinned_rate(self):
+        code, text = self.run_rates("--update", "--yes")
+        self.assertIn("pinned to published pricing", text)
+        # Other models are still written; only the pinned one is held back, so
+        # the refusal has to be checked in the file rather than by its absence.
+        with open(self.override) as fh:
+            written = json.load(fh)
+        self.assertNotIn("claude-sonnet-5", written.get("models", {}))
+        self.assertIn("claude-alpha-1", written.get("models", {}))
+
+    def test_sonnet_5_does_not_rise_on_the_cancelled_date(self):
+        """The regression this pin exists to prevent: a 50% overcharge."""
+        out = subprocess.run(
+            [sys.executable, "-m", "tkus", "rates", "--json", "--at", "2026-09-01"],
+            cwd=self.tmp, env=dict(os.environ, PYTHONPATH=PROJECT),
+            stdout=subprocess.PIPE)
+        rows = json.loads(out.stdout.decode())["models"]
+        sonnet = [r for r in rows if r["model"] == "claude-sonnet-5"][0]
+        self.assertEqual(sonnet["input"], 2.0)
+        self.assertEqual(sonnet["output"], 10.0)
+
+    def test_sonnet_5_is_priced_the_same_on_every_date(self):
+        for date in ("2026-01-01", "2026-08-31", "2026-09-01", "2027-01-01"):
+            out = subprocess.run(
+                [sys.executable, "-m", "tkus", "rates", "--json", "--at", date],
+                cwd=self.tmp, env=dict(os.environ, PYTHONPATH=PROJECT),
+                stdout=subprocess.PIPE)
+            rows = json.loads(out.stdout.decode())["models"]
+            sonnet = [r for r in rows if r["model"] == "claude-sonnet-5"][0]
+            self.assertEqual(sonnet["input"], 2.0, "wrong on %s" % date)
