@@ -135,3 +135,37 @@ class TestCorruption(CursorTestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestReadsDoNotMutate(CursorTestCase):
+    """A query must not leave state behind in a repository it only looked at.
+
+    `tkus report` runs without `tkus install`, by design: it reads the agents'
+    own transcripts and filters them by repository, so it needs no hooks. That
+    makes it a read of an otherwise untouched repo, and a read that creates
+    `.git/tkus/` is a side effect a report has no business having.
+    """
+
+    def _state_path(self):
+        return os.path.join(cursor.git_dir(self.repo), "tkus")
+
+    def test_reading_the_cursor_creates_nothing(self):
+        self.assertIsNone(cursor.cursor_since(self.repo))
+        self.assertFalse(os.path.exists(self._state_path()))
+
+    def test_reading_pending_creates_nothing(self):
+        self.assertEqual(cursor.read_pending(self.repo), {})
+        self.assertFalse(os.path.exists(self._state_path()))
+
+    def test_reading_the_local_ledger_creates_nothing(self):
+        from tkus import ledger
+        self.assertFalse(ledger.read_all(self.repo))
+        self.assertFalse(os.path.exists(self._state_path()))
+
+    def test_reset_on_a_clean_repo_creates_nothing(self):
+        cursor.reset(self.repo)
+        self.assertFalse(os.path.exists(self._state_path()))
+
+    def test_writing_still_creates_the_directory(self):
+        cursor.write_pending(self.repo, T1)
+        self.assertTrue(os.path.isdir(self._state_path()))

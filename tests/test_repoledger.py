@@ -17,7 +17,7 @@ import tempfile
 import unittest
 from datetime import datetime, timezone
 
-from tkus import repoledger
+from tkus import cursor, hooks, repoledger
 from tkus.pricing import RateTable
 
 PROJECT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -410,3 +410,63 @@ class TestUpgradeFromTrailerVersion(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestReportWithoutInstall(RepoLedgerTestCase):
+    """`tkus report` works in an uninstalled repo -- but says so.
+
+    Reading is not recording. `report` queries the agents' transcripts directly
+    and filters by repository, so it never needs a hook. The risk is that its
+    "since the beginning" header reads like a backlog awaiting attribution when
+    in fact nothing is recording and nothing ever will be.
+    """
+
+    def _report(self):
+        out = subprocess.run([sys.executable, "-m", "tkus", "report"],
+                             cwd=self.repo, stdout=subprocess.PIPE,
+                             stderr=subprocess.STDOUT, env=self.env)
+        return out.returncode, out.stdout.decode()
+
+    def _uninstall(self):
+        subprocess.run([sys.executable, "-m", "tkus", "uninstall"], cwd=self.repo,
+                       env=self.env, stdout=subprocess.DEVNULL, check=True)
+        self.assertFalse(hooks.is_installed(self.repo))
+
+    def test_succeeds_and_warns_when_not_installed(self):
+        self._uninstall()
+        code, text = self._report()
+        self.assertEqual(code, 0)
+        self.assertIn("not installed", text)
+
+    def test_warns_even_when_there_is_no_usage_to_show(self):
+        """The empty case is the common one in a fresh repo, and the one where
+        the reason for the emptiness matters most."""
+        self._uninstall()
+        code, text = self._report()
+        self.assertIn("no AI usage found", text)
+        self.assertIn("not installed", text)
+
+    def test_is_silent_once_installed(self):
+        code, text = self._report()
+        self.assertEqual(code, 0)
+        self.assertNotIn("not installed", text)
+
+    def test_report_creates_no_state_when_uninstalled(self):
+        self._uninstall()
+        shutil.rmtree(os.path.join(cursor.git_dir(self.repo), "tkus"),
+                      ignore_errors=True)
+        self._report()
+        self.assertFalse(os.path.exists(
+            os.path.join(cursor.git_dir(self.repo), "tkus")))
+
+    def test_partial_install_still_counts_as_not_installed(self):
+        """One hook missing means recording is broken, not merely degraded."""
+        os.remove(os.path.join(cursor.git_dir(self.repo), "hooks", "pre-commit"))
+        self.assertFalse(hooks.is_installed(self.repo))
+
+    def test_a_foreign_hook_does_not_count_as_installed(self):
+        directory = os.path.join(cursor.git_dir(self.repo), "hooks")
+        for name in hooks.HOOKS:
+            with open(os.path.join(directory, name), "w") as fh:
+                fh.write("#!/bin/sh\necho someone elses hook\n")
+        self.assertFalse(hooks.is_installed(self.repo))

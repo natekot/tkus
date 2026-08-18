@@ -38,8 +38,8 @@ _FIELDS = [
 ]
 
 
-def path(repo_root: str) -> str:
-    return os.path.join(state_dir(repo_root), LEDGER_FILE)
+def path(repo_root: str, create: bool = False) -> str:
+    return os.path.join(state_dir(repo_root, create=create), LEDGER_FILE)
 
 
 def build_entry(totals_by_key, cost, sha=None, at=None) -> dict:
@@ -87,7 +87,7 @@ def totals_from_entry(entry: dict) -> Dict[tuple, ModelTotals]:
 def append(repo_root: str, entry: dict) -> None:
     """Add one record. Never raises -- a ledger problem must not fail a commit."""
     try:
-        with open(path(repo_root), "a") as fh:
+        with open(path(repo_root, create=True), "a") as fh:
             fh.write(json.dumps(entry, sort_keys=True) + "\n")
     except (OSError, TypeError, ValueError):
         pass

@@ -89,6 +89,12 @@ def _remove_legacy(directory: str) -> List[str]:
     return notes
 
 
+def is_installed(repo_root: str) -> bool:
+    """True when every hook tkus needs is present and managed by us."""
+    directory = os.path.join(git_dir(repo_root), "hooks")
+    return all(_is_ours(os.path.join(directory, name)) for name in HOOKS)
+
+
 def install(repo_root: str, python: str = None) -> List[str]:
     """Install both hooks. Returns human-readable notes about what happened."""
     python = python or sys.executable or "python3"

@@ -298,6 +298,27 @@ transcript store.
 | `tkus reprice` | Re-price the ledger with the current rate table |
 | `tkus show [<commit>]` | Per-commit detail from the local `.git/` ledger |
 
+### Reading does not require installing
+
+`tkus report` works in **any** git repository, whether or not `tkus install` has
+been run there. It reads the agents' own transcripts and filters them by
+repository path, so it needs no hooks and writes nothing — you can use it to see
+what a repo has cost before deciding to record anything. When hooks are absent it
+says so, because otherwise its "since the beginning" window looks like a backlog
+awaiting attribution when in fact nothing is recording.
+
+The other read commands do depend on installation, because they read what the
+hooks wrote:
+
+| Command | Reads | Needs `tkus install`? |
+|---|---|---|
+| `tkus report` | The agents' transcripts, live | No |
+| `tkus rollup` | The tracked `.tkus/` ledger | Yes |
+| `tkus show` | The local `.git/` ledger | Yes |
+
+So `report` showing a large figure while `rollup` shows nothing is the expected
+signal that a repository has AI usage but is not recording it.
+
 ---
 
 ## Configuration

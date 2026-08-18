@@ -36,9 +36,14 @@ def git_dir(repo_root: str) -> str:
     return out.decode().strip()
 
 
-def state_dir(repo_root: str) -> str:
+def state_dir(repo_root: str, create: bool = True) -> str:
+    """Where tkus keeps its per-repo state.
+
+    `create=False` for read paths: a query like `tkus report` must not leave a
+    directory behind in a repository it was only asked to look at.
+    """
     path = os.path.join(git_dir(repo_root), STATE_DIR)
-    if not os.path.isdir(path):
+    if create and not os.path.isdir(path):
         os.makedirs(path)
     return path
 
@@ -61,7 +66,7 @@ def _write(path: str, data: dict) -> None:
 
 
 def read_cursor(repo_root: str) -> dict:
-    return _read(os.path.join(state_dir(repo_root), CURSOR_FILE))
+    return _read(os.path.join(state_dir(repo_root, create=False), CURSOR_FILE))
 
 
 def cursor_since(repo_root: str, amending: bool = False) -> Optional[datetime]:
@@ -92,7 +97,7 @@ def write_pending(repo_root, window_end, amending=False, detail=None):
 
 
 def read_pending(repo_root: str) -> dict:
-    return _read(os.path.join(state_dir(repo_root), PENDING_FILE))
+    return _read(os.path.join(state_dir(repo_root, create=False), PENDING_FILE))
 
 
 def promote_pending(repo_root: str) -> Optional[datetime]:
@@ -130,7 +135,7 @@ def promote_pending(repo_root: str) -> Optional[datetime]:
 
 
 def reset(repo_root: str) -> None:
-    directory = state_dir(repo_root)
+    directory = state_dir(repo_root, create=False)
     for name in (CURSOR_FILE, PENDING_FILE):
         try:
             os.remove(os.path.join(directory, name))

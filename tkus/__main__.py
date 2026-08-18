@@ -16,6 +16,7 @@ from collections import OrderedDict
 from datetime import datetime, timezone
 from typing import Dict, List, Optional
 
+from . import __version__
 from . import cursor as cursor_mod
 from . import hooks, ledger, repoledger
 from .pricing import RateTable, compute_cost, compute_cost_from_totals
@@ -23,7 +24,6 @@ from .providers import claude_code  # noqa: F401  (registers the provider)
 from .providers import copilot  # noqa: F401  (registers the provider)
 from .providers.base import aggregate_by_model, collect_all, format_timestamp
 
-__version__ = "0.2.0"
 
 
 def repo_root(start: Optional[str] = None) -> str:
@@ -152,6 +152,18 @@ def cmd_uninstall(args) -> int:
     return 0
 
 
+def _warn_if_not_installed(root: str) -> None:
+    """`report` reads agent transcripts directly, so it works with no hooks at
+    all. Say so, or its "since the beginning" window reads like a backlog
+    waiting to be attributed when nothing is recording and nothing ever will."""
+    if hooks.is_installed(root):
+        return
+    print()
+    print("note: tkus is not installed in this repository, so this usage will "
+          "never be attributed to a commit.")
+    print("      run `tkus install` to start recording.")
+
+
 def _print_table(totals, cost) -> None:
     if not totals:
         print("no AI usage found for this window")
@@ -199,6 +211,7 @@ def cmd_report(args) -> int:
         print("Unattributed usage since %s\n"
               % (since.isoformat() if since else "the beginning"))
     _print_table(aggregate_by_model(records), cost)
+    _warn_if_not_installed(root)
     return 0
 
 
