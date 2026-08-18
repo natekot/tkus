@@ -1,0 +1,1 @@
+{"at": "2026-08-18T21:47:56.512Z", "currency": "USD", "parent": "fb28553e36f33abeec469a9918f90ce9354b379a", "providers": [{"cr": 583272, "cw1h": 2379, "in": 4, "model": "claude-opus-5", "out": 2161, "provider": "claude-code", "reqs": 2, "usd": 0.369471}], "rates_version": "2026-08", "since": "2026-08-18T21:47:00.884Z", "until": "2026-08-18T21:47:56.512Z", "usd": 0.369471}
