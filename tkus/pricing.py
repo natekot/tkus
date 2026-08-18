@@ -20,6 +20,15 @@ BUNDLED_RATES = os.path.join(os.path.dirname(os.path.abspath(__file__)), "rates.
 REPO_OVERRIDE = ".tkus.json"
 
 
+class RateTableError(Exception):
+    """A rate override exists but cannot be read.
+
+    Raised rather than ignored: a malformed override must not silently fall
+    back to list prices, because the reason to have one is usually a negotiated
+    rate, and quietly billing at list would be worse than failing.
+    """
+
+
 def _global_config_dir() -> str:
     base = os.environ.get("XDG_CONFIG_HOME") or os.path.expanduser("~/.config")
     return os.path.join(base, "tkus")
@@ -86,8 +95,13 @@ class RateTable:
             if repo_root is None and path.endswith(REPO_OVERRIDE):
                 continue
             if os.path.isfile(path):
-                with open(path, "r") as fh:
-                    override = json.load(fh)
+                try:
+                    with open(path, "r") as fh:
+                        override = json.load(fh)
+                except (OSError, ValueError) as exc:
+                    raise RateTableError("%s: %s" % (path, exc))
+                if not isinstance(override, dict):
+                    raise RateTableError("%s: expected a JSON object" % path)
                 if any(key in cls.RATE_KEYS for key in override):
                     rates_overridden = True
                 data = _deep_merge(data, override)

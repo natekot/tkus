@@ -18,8 +18,9 @@ from typing import Dict, List, Optional
 
 from . import __version__
 from . import cursor as cursor_mod
-from . import hooks, ledger, repoledger
-from .pricing import RateTable, compute_cost, compute_cost_from_totals
+from . import catalog, hooks, ledger, repoledger
+from .pricing import (RateTable, RateTableError, compute_cost,
+                      compute_cost_from_totals)
 from .providers import claude_code  # noqa: F401  (registers the provider)
 from .providers import copilot  # noqa: F401  (registers the provider)
 from .providers.base import aggregate_by_model, collect_all, format_timestamp
@@ -422,7 +423,272 @@ def _scheduled_changes(table, when):
     return sorted(out, key=lambda r: (r["from"], r["model"]))
 
 
+def _active_window(table, model, speed, when):
+    """The rate window in force, so its `until` can be inspected.
+
+    `RateTable.rate_for` returns only the prices; a drift check also has to know
+    whether the window it would be contradicting is a deliberate, dated one.
+    """
+    entry = table.data.get("models", {}).get(table.canonical(model))
+    if not entry:
+        return None
+    day = when.strftime("%Y-%m-%d")
+    for window in entry.get(speed) or entry.get("standard") or []:
+        start, end = window.get("from"), window.get("until")
+        if start and day < start:
+            continue
+        if end and day > end:
+            continue
+        return window
+    return None
+
+
+def _rate_drift(table, data, when):
+    """Bundled table vs the installed Claude Code catalog.
+
+    Only `standard` is compared: the catalog carries no speed dimension, so a
+    fast-mode rate has nothing upstream to disagree with.
+    """
+    changed, missing = [], []
+    for entry in data["models"]:
+        model = entry["id"]
+        upstream = data["tiers"][entry["tier"]]
+        current = table.rate_for(model, "standard", when)
+        if current is None:
+            missing.append({"model": model, "input": upstream["input"],
+                            "output": upstream["output"], "tier": entry["tier"]})
+            continue
+        window = _active_window(table, model, "standard", when) or {}
+        for index, field in ((0, "input"), (1, "output")):
+            if abs(current[index] - upstream[field]) > 1e-9:
+                changed.append({
+                    "model": model, "field": field,
+                    "bundled": current[index], "upstream": upstream[field],
+                    # A window with an explicit end is a deliberate statement the
+                    # catalog cannot make -- it has no dates. Overwriting it
+                    # would discard information rather than refresh it.
+                    "dated": bool(window.get("until") or window.get("from")),
+                    "until": window.get("until"),
+                })
+    known = set(table.data.get("aliases", {}))
+    alias_gaps = {dated: canonical
+                  for dated, canonical in catalog.aliases(data).items()
+                  if dated not in known}
+    return {
+        "changed": changed, "missing": missing, "alias_gaps": alias_gaps,
+        "multiplier_conflicts": catalog.multiplier_conflicts(data, table),
+    }
+
+
+def _print_drift(drift, data, table) -> None:
+    print("compared against Claude Code %s\n" % data["version"])
+    changed, missing = drift["changed"], drift["missing"]
+
+    if changed:
+        width = max(len(c["model"]) for c in changed)
+        header = "%-*s %-7s %12s -> %-12s" % (width, "model", "field",
+                                              "bundled", "claude-code")
+        print(header)
+        print("-" * len(header))
+        for c in changed:
+            note = "  [dated window%s]" % (
+                " ending %s" % c["until"] if c["until"] else "") if c["dated"] else ""
+            print("%-*s %-7s %12s -> %-12s%s" % (
+                width, c["model"], c["field"], _money(c["bundled"]),
+                _money(c["upstream"]), note))
+        print()
+
+    if missing:
+        print("absent from the bundled table (priced as zero today):")
+        for m in missing:
+            print("  %-22s %s / %s" % (m["model"], _money(m["input"]),
+                                       _money(m["output"])))
+        print()
+
+    for conflict in drift["multiplier_conflicts"]:
+        print("warning: %s %s is %s upstream, but the multipliers imply %s -- "
+              "cache pricing can no longer be expressed as a multiple of input."
+              % (conflict["tier"], conflict["field"], _money(conflict["actual"]),
+                 _money(conflict["expected"])))
+
+    if drift["alias_gaps"]:
+        print("dated model IDs with no alias (%d):" % len(drift["alias_gaps"]))
+        for dated, canonical in sorted(drift["alias_gaps"].items()):
+            print("  %s -> %s" % (dated, canonical))
+        print()
+
+    dated = [c for c in changed if c["dated"]]
+    if dated:
+        print("%d change(s) fall inside a dated window and are not "
+              "auto-resolvable: the catalog carries no dates, so it cannot "
+              "express introductory or scheduled pricing." % len(dated))
+    if not changed and not missing:
+        print("bundled table agrees with the catalog.")
+
+
+def _override_path() -> str:
+    from .pricing import _global_config_dir
+    return os.path.join(_global_config_dir(), "rates.json")
+
+
+def _build_update(table, data, drift, when, existing):
+    """The override to write, plus everything deliberately left alone.
+
+    Three refusals, each because the catalog cannot express what it would be
+    overwriting:
+
+    * A model the user has already overridden locally is almost certainly a
+      negotiated rate. Replacing it with a list price would quietly undo the
+      thing the override exists for.
+    * A dated window is a statement the catalog cannot make -- it carries no
+      dates, so it cannot distinguish "the price changed" from "introductory
+      pricing is still running".
+    * Fast-mode pricing has no counterpart upstream at all.
+    """
+    from datetime import timedelta
+
+    existing_models = (existing.get("models") or {})
+    today = when.strftime("%Y-%m-%d")
+    yesterday = (when - timedelta(days=1)).strftime("%Y-%m-%d")
+
+    models, skipped = OrderedDict(), []
+
+    for entry in drift["missing"]:
+        name = entry["model"]
+        if name in existing_models:
+            skipped.append((name, "already overridden locally"))
+            continue
+        models[name] = {"standard": [{"from": None, "until": None,
+                                      "input": entry["input"],
+                                      "output": entry["output"]}]}
+
+    by_model = OrderedDict()
+    for change in drift["changed"]:
+        by_model.setdefault(change["model"], []).append(change)
+
+    for name, changes in by_model.items():
+        if name in existing_models:
+            skipped.append((name, "already overridden locally"))
+            continue
+        if any(c["dated"] for c in changes):
+            skipped.append((name, "inside a dated window the catalog cannot express"))
+            continue
+        upstream = catalog.rate_for(data, name)
+        if not upstream:
+            continue
+        current = table.data.get("models", {}).get(table.canonical(name), {})
+        windows = [dict(w) for w in (current.get("standard") or [])]
+        active = _active_window(table, name, "standard", when)
+        for window in windows:
+            # Close the window rather than editing it, so `tkus reprice` keeps
+            # historical commits at the rates that actually applied to them.
+            if active is not None and window.get("from") == active.get("from") \
+                    and window.get("until") == active.get("until"):
+                window["until"] = yesterday
+        windows.append({"from": today, "until": None,
+                        "input": upstream["input"], "output": upstream["output"]})
+        # Only `standard` is replaced; a `fast` block on the same model is left
+        # untouched by the deep merge.
+        models[name] = {"standard": windows}
+
+    proposal = {}
+    if models:
+        proposal["models"] = models
+    aliases = {k: v for k, v in drift["alias_gaps"].items()
+               if k not in (existing.get("aliases") or {})}
+    if aliases:
+        proposal["aliases"] = aliases
+    return proposal, skipped
+
+
+def cmd_rates_update(args) -> int:
+    table = RateTable.load(_repo_root_or_none())
+    when = _rates_when(args)
+    data = catalog.extract()
+    if data is None:
+        print("could not read a pricing catalog from Claude Code; nothing to "
+              "update. The bundled table is unchanged and still in use.")
+        return 0
+
+    path = _override_path()
+    existing = {}
+    if os.path.isfile(path):
+        try:
+            with open(path) as handle:
+                loaded = json.load(handle)
+            existing = loaded if isinstance(loaded, dict) else {}
+        except (OSError, ValueError):
+            sys.exit("tkus: %s exists but is not readable JSON; refusing to "
+                     "overwrite it." % path)
+
+    drift = _rate_drift(table, data, when)
+    proposal, skipped = _build_update(table, data, drift, when, existing)
+
+    for name, why in skipped:
+        print("left alone: %s -- %s" % (name, why))
+    if not proposal:
+        print("\nnothing to write." if skipped else "bundled table agrees with "
+              "the catalog; nothing to write.")
+        return 0
+
+    merged = dict(existing)
+    for key, value in proposal.items():
+        combined = dict(merged.get(key) or {})
+        combined.update(value)
+        merged[key] = combined
+
+    print("\nwould write %s:\n" % path)
+    print(json.dumps(proposal, indent=2, sort_keys=True))
+
+    if not getattr(args, "yes", False):
+        print("\ndry run. Re-run with --yes to write it.")
+        return 0
+
+    directory = os.path.dirname(path)
+    if directory and not os.path.isdir(directory):
+        os.makedirs(directory)
+    tmp = path + ".tmp"
+    with open(tmp, "w") as handle:
+        json.dump(merged, handle, indent=2, sort_keys=True)
+        handle.write("\n")
+    os.replace(tmp, path)
+    print("\nwrote %s" % path)
+    print("rates are now marked as overridden; `tkus rates` will say so.")
+    return 0
+
+
+def cmd_rates_check(args) -> int:
+    table = RateTable.load(_repo_root_or_none())
+    when = _rates_when(args)
+    data = catalog.extract()
+    if data is None:
+        # Absence is not drift. A machine without Claude Code, or a release that
+        # moved the catalog, must not look like a pricing change.
+        message = ("could not read a pricing catalog from Claude Code; "
+                   "the bundled table is unchanged and still in use.")
+        if getattr(args, "json", False):
+            json.dump({"available": False, "reason": message}, sys.stdout, indent=2)
+            sys.stdout.write("\n")
+        else:
+            print(message)
+        return 0
+
+    drift = _rate_drift(table, data, when)
+    if getattr(args, "json", False):
+        json.dump(dict(drift, available=True, claude_code=data["version"],
+                       source=data["path"]),
+                  sys.stdout, indent=2, sort_keys=True, default=str)
+        sys.stdout.write("\n")
+    else:
+        _print_drift(drift, data, table)
+    return 1 if (drift["changed"] or drift["missing"]) else 0
+
+
 def cmd_rates(args) -> int:
+    if getattr(args, "check", False):
+        return cmd_rates_check(args)
+    if getattr(args, "update", False):
+        return cmd_rates_update(args)
     root = _repo_root_or_none()
     table = RateTable.load(root)
     when = _rates_when(args)
@@ -537,6 +803,14 @@ def build_parser() -> argparse.ArgumentParser:
     rates = sub.add_parser("rates", help="show the rate table used for pricing")
     rates.add_argument("--at", metavar="YYYY-MM-DD",
                        help="rates in effect on this date (default today)")
+    rates.add_argument("--check", action="store_true",
+                       help="compare against the installed Claude Code catalog; "
+                            "exit 1 if they disagree. Writes nothing.")
+    rates.add_argument("--update", action="store_true",
+                       help="write refreshed rates to the global override file; "
+                            "a dry run unless --yes is given")
+    rates.add_argument("--yes", action="store_true",
+                       help="with --update, actually write the file")
     rates.add_argument("--json", action="store_true",
                        help="machine-readable output")
     rates.set_defaults(func=cmd_rates)
@@ -553,7 +827,13 @@ def main(argv: Optional[List[str]] = None) -> int:
     if not getattr(args, "func", None):
         build_parser().print_help()
         return 1
-    return args.func(args)
+    try:
+        return args.func(args)
+    except RateTableError as exc:
+        # A traceback here would be noise: the fault is in a config file the
+        # user owns, and the fix is to correct or remove it.
+        sys.stderr.write("tkus: %s\n" % exc)
+        return 1
 
 
 if __name__ == "__main__":

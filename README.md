@@ -298,6 +298,8 @@ transcript store.
 | `tkus reprice` | Re-price the ledger with the current rate table |
 | `tkus show [<commit>]` | Per-commit detail from the local `.git/` ledger |
 | `tkus rates [--at DATE] [--json]` | The rate table used for pricing |
+| `tkus rates --check` | Compare against the installed Claude Code; exit 1 on drift |
+| `tkus rates --update [--yes]` | Write refreshed rates to the global override |
 
 ### Seeing the rates
 
@@ -323,6 +325,51 @@ table as of any date, and `--json` emits the same data for scripts.
 Like `tkus report`, it needs no installation — and it works outside a git
 repository entirely, though a repository-level `.tkus.json` override obviously
 cannot apply there.
+
+### Keeping the rates current
+
+`rates.json` is maintained by hand, so it rots silently — and a stale table
+misstates real money when users are billed per token. `tkus rates --check`
+compares it against the model catalog embedded in the **installed Claude Code
+binary**:
+
+```
+$ tkus rates --check
+compared against Claude Code 2.1.227
+
+model           field        bundled -> claude-code
+---------------------------------------------------
+claude-sonnet-5 input           2.00 -> 3.00          [dated window ending 2026-08-31]
+```
+
+That source is deliberate. There is no rate-card API — `GET /v1/models` returns
+capabilities and context sizes but no prices — and the community JSON that does
+carry prices lists only Bedrock regional variants for current models, where
+picking the wrong key overstates by 10% invisibly. Claude Code ships
+first-party pricing in the same shape tkus stores, on every machine that already
+has it, **with no network call**, so the tool keeps its promise of never
+reaching out.
+
+`--check` writes nothing and exits 1 on drift, which makes it usable in CI. A
+machine without Claude Code exits 0: absence is not drift.
+
+`tkus rates --update` writes the refreshed rates to
+`~/.config/tkus/rates.json` — never to the bundled table — and is a dry run
+unless you pass `--yes`. It refuses three things, because the catalog cannot
+express them:
+
+| Left alone | Why |
+|---|---|
+| A model you already override locally | Almost certainly a negotiated rate; a list price must not undo it |
+| A dated window (e.g. introductory pricing) | The catalog carries no dates, so it cannot tell a price change from a promotion still running |
+| `fast` pricing | The catalog has no speed dimension at all |
+
+When a price does change, the old window is **closed** rather than rewritten, so
+`tkus reprice` keeps historical commits at the rates that actually applied.
+
+> This reads an undocumented internal of another program, which may change in
+> any Claude Code release. It never raises: if the catalog cannot be read, tkus
+> says so and keeps using the bundled table.
 
 ### Reading does not require installing
 
