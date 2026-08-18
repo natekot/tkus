@@ -297,6 +297,32 @@ transcript store.
 | `tkus rollup [--by branch\|identity\|date]` | Totals from the tracked ledger |
 | `tkus reprice` | Re-price the ledger with the current rate table |
 | `tkus show [<commit>]` | Per-commit detail from the local `.git/` ledger |
+| `tkus rates [--at DATE] [--json]` | The rate table used for pricing |
+
+### Seeing the rates
+
+`tkus rates` prints the table every cost figure is derived from. The stored
+table expresses cache prices as multipliers on the input rate; this resolves
+them into money, because what matters when checking an invoice is that a cache
+read costs $0.50/MTok, not that it is 0.1x something else.
+
+```
+USD per 1M tokens
+model             speed        input    output  cache-wr-1h  cache-wr-5m   cache-rd
+-----------------------------------------------------------------------------------
+claude-opus-5     standard      5.00     25.00        10.00         6.25       0.50
+claude-opus-5     fast         10.00     50.00        20.00        12.50       1.00
+```
+
+It also reports the AI Unit conversion used for Copilot, any batch tier
+discount, which files the rates came from, and whether an override is in
+effect. Rates that change on a future date are listed under **Scheduled
+changes**, so a price rise cannot arrive unnoticed; `--at YYYY-MM-DD` shows the
+table as of any date, and `--json` emits the same data for scripts.
+
+Like `tkus report`, it needs no installation — and it works outside a git
+repository entirely, though a repository-level `.tkus.json` override obviously
+cannot apply there.
 
 ### Reading does not require installing
 

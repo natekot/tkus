@@ -38,6 +38,29 @@ def repo_root(start: Optional[str] = None) -> str:
     return out.decode().strip()
 
 
+def _repo_root_or_none() -> Optional[str]:
+    """repo_root() without the exit: rates are global, and are worth reading
+    outside a repository even though a repository can override them."""
+    try:
+        out = subprocess.check_output(
+            ["git", "rev-parse", "--show-toplevel"],
+            cwd=os.getcwd(), stderr=subprocess.DEVNULL)
+    except (subprocess.CalledProcessError, OSError):
+        return None
+    return out.decode().strip() or None
+
+
+def _rates_when(args) -> datetime:
+    value = getattr(args, "at", None)
+    if not value:
+        return now()
+    try:
+        parsed = datetime.strptime(value, "%Y-%m-%d")
+    except ValueError:
+        sys.exit("tkus: --at expects YYYY-MM-DD, got %r" % value)
+    return parsed.replace(tzinfo=timezone.utc)
+
+
 def now() -> datetime:
     return datetime.now(timezone.utc)
 
@@ -342,6 +365,142 @@ def cmd_hook(args) -> int:
         return 0
 
 
+def _money(value: float) -> str:
+    """Two decimals when that is exact, more when it is not."""
+    for places in (2, 4, 6):
+        text = "%.*f" % (places, value)
+        if abs(float(text) - value) < 1e-12:
+            return text
+    return "%.6f" % value
+
+
+def _rate_rows(table, when):
+    """Effective per-MTok prices for every model, cache class expanded.
+
+    The table stores cache prices as multipliers on the input rate, which is
+    the one thing a reader cannot do in their head. What matters at the point of
+    use is that a cache read costs $0.50/MTok -- not that it is 0.1x something
+    else -- so the multipliers are resolved into money here.
+    """
+    rows = []
+    mult = (("cache_write_1h", 2.0), ("cache_write_5m", 1.25), ("cache_read", 0.1))
+    for model, entry in (table.data.get("models") or {}).items():
+        for speed in entry:
+            rate = table.rate_for(model, speed, when)
+            if not rate:
+                continue          # priced only outside this date
+            inp, out = rate
+            row = {"model": model, "speed": speed, "input": inp, "output": out}
+            for name, default in mult:
+                # Rounded because 3.0 * 0.1 is 0.30000000000000004, which is
+                # correct and unreadable. Ten places is far below the precision
+                # of any published rate, so nothing real is lost.
+                row[name] = round(inp * table.multiplier(name, default), 10)
+            rows.append(row)
+    return rows
+
+
+def _scheduled_changes(table, when):
+    """Price windows that begin after `when`, so a change cannot arrive unseen."""
+    day = when.strftime("%Y-%m-%d")
+    out = []
+    for model, entry in (table.data.get("models") or {}).items():
+        for speed, windows in entry.items():
+            current = table.rate_for(model, speed, when)
+            for window in windows:
+                start = window.get("from")
+                if not start or start <= day:
+                    continue
+                out.append({
+                    "model": model, "speed": speed, "from": start,
+                    "input": float(window["input"]),
+                    "output": float(window["output"]),
+                    "from_input": current[0] if current else None,
+                    "from_output": current[1] if current else None,
+                    "note": window.get("note"),
+                })
+    return sorted(out, key=lambda r: (r["from"], r["model"]))
+
+
+def cmd_rates(args) -> int:
+    root = _repo_root_or_none()
+    table = RateTable.load(root)
+    when = _rates_when(args)
+    rows = _rate_rows(table, when)
+    changes = _scheduled_changes(table, when)
+
+    if getattr(args, "json", False):
+        json.dump({
+            "version": table.version, "currency": table.currency,
+            "effective": when.strftime("%Y-%m-%d"),
+            "unit": "per 1000000 tokens",
+            "overridden": table.is_overridden,
+            "usd_per_aiu": table.data.get("usd_per_aiu"),
+            "tier_multipliers": table.data.get("tier_multipliers", {}),
+            "models": rows, "scheduled_changes": changes,
+            "sources": table.sources,
+        }, sys.stdout, indent=2, sort_keys=True)
+        sys.stdout.write("\n")
+        return 0
+
+    print("Rate table %s (%s), effective %s\n"
+          % (table.version, table.currency, when.strftime("%Y-%m-%d")))
+
+    if rows:
+        print("%s per 1M tokens" % table.currency)
+        mwidth = max(max(len(r["model"]) for r in rows), len("model"))
+        swidth = max(max(len(r["speed"]) for r in rows), len("speed"))
+        header = "%-*s %-*s %9s %9s %12s %12s %10s" % (
+            mwidth, "model", swidth, "speed", "input", "output",
+            "cache-wr-1h", "cache-wr-5m", "cache-rd")
+        print(header)
+        print("-" * len(header))
+        for r in rows:
+            # input/output are authored at 2dp, but the cache columns are
+            # products of a multiplier and can land anywhere -- a negotiated
+            # 3.50 makes cache-read 0.175, and rounding that to 0.18 is a 3%
+            # error on the largest token class most sessions have.
+            print("%-*s %-*s %9.2f %9.2f %12s %12s %10s" % (
+                mwidth, r["model"], swidth, r["speed"], r["input"], r["output"],
+                _money(r["cache_write_1h"]), _money(r["cache_write_5m"]),
+                _money(r["cache_read"])))
+        print()
+
+    tiers = table.data.get("tier_multipliers") or {}
+    non_standard = ["%s x%g" % (k, v) for k, v in sorted(tiers.items()) if v != 1.0]
+    if non_standard:
+        print("Tiers, applied to every rate above: %s" % ", ".join(non_standard))
+
+    aiu = table.data.get("usd_per_aiu")
+    if aiu:
+        print("Copilot bills in AI Units, recorded per request: "
+              "1 AIU = %s %.4f" % (table.currency, float(aiu)))
+
+    tools = table.data.get("server_tools") or {}
+    for name, price in sorted(tools.items()):
+        print("Server tool %s: %s %.2f" % (name, table.currency, price))
+
+    if changes:
+        print("\nScheduled changes")
+        for c in changes:
+            detail = "input %.2f -> %.2f, output %.2f -> %.2f" % (
+                c["from_input"], c["input"], c["from_output"], c["output"]
+            ) if c["from_input"] is not None else (
+                "input %.2f, output %.2f" % (c["input"], c["output"]))
+            print("  %s  %s (%s)  %s%s" % (
+                c["from"], c["model"], c["speed"], detail,
+                " -- %s" % c["note"] if c.get("note") else ""))
+
+    print("\nSources")
+    for path in table.sources:
+        print("  %s" % path)
+    print("%s prices" % ("overridden" if table.is_overridden else "list"))
+    if not root:
+        print("note: not inside a git repository, so any repository-level "
+              "%s was not applied." % REPO_CONFIG)
+    return 0
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="tkus",
@@ -374,6 +533,13 @@ def build_parser() -> argparse.ArgumentParser:
     show = sub.add_parser("show", help="per-commit detail from the local ledger")
     show.add_argument("commit", nargs="?", help="commit-ish (default HEAD)")
     show.set_defaults(func=cmd_show)
+
+    rates = sub.add_parser("rates", help="show the rate table used for pricing")
+    rates.add_argument("--at", metavar="YYYY-MM-DD",
+                       help="rates in effect on this date (default today)")
+    rates.add_argument("--json", action="store_true",
+                       help="machine-readable output")
+    rates.set_defaults(func=cmd_rates)
 
     hook = sub.add_parser("hook", help=argparse.SUPPRESS)
     hook.add_argument("name")
