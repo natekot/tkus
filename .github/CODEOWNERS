@@ -1,0 +1,6 @@
+# Every change to this repository requires review from @natekot.
+#
+# Paired with branch protection on `main` (require a pull request, 1 approving
+# review, and code-owner review), this makes @natekot a required reviewer on
+# every pull request rather than merely a suggested one.
+*       @natekot
