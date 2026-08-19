@@ -1,6 +1,13 @@
-# Every change to this repository requires review from @natekot.
+# Every change to this repository requires review from a code owner.
 #
 # Paired with branch protection on `main` (require a pull request, 1 approving
-# review, and code-owner review), this makes @natekot a required reviewer on
-# every pull request rather than merely a suggested one.
-*       @natekot
+# review, and code-owner review), this makes review by one of these accounts
+# mandatory on every pull request rather than merely suggested.
+#
+# Both accounts belong to Nate Kot: @natekot personally, @nate-kot for work.
+# Listing both is what lets a pull request opened from one be approved from the
+# other -- GitHub never allows an author to approve their own pull request.
+#
+# Note that one approval from EITHER owner satisfies the requirement. Requiring
+# both would mean raising required_approving_review_count to 2.
+*       @natekot @nate-kot
