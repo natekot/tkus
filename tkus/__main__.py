@@ -10,6 +10,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import shutil
 import subprocess
 import sys
 from collections import OrderedDict
@@ -67,12 +68,20 @@ def now() -> datetime:
 
 
 def head_sha(root: str) -> Optional[str]:
+    """HEAD's sha, or None before the first commit exists.
+
+    The return code has to be checked: on an unborn branch `git rev-parse HEAD`
+    exits 128 but still prints the literal string "HEAD" on stdout, which would
+    otherwise be recorded as an entry's parent and match no commit ever.
+    """
     try:
         out = subprocess.run(["git", "rev-parse", "HEAD"], cwd=root,
                              stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
-        return out.stdout.decode().strip() or None
     except (OSError, subprocess.SubprocessError):
         return None
+    if out.returncode != 0:
+        return None
+    return out.stdout.decode().strip() or None
 
 
 # --------------------------------------------------------------------------
@@ -239,13 +248,23 @@ def cmd_report(args) -> int:
     return 0
 
 
+def _ledger_scope(rel: str) -> tuple:
+    """Split `.tkus/<identity>/<branch>.jsonl` into (identity, branch).
+
+    The branch keeps its slashes: `repoledger.branch_name` writes `feature/x`
+    as a nested directory, so everything after the identity is the branch name.
+    """
+    parts = rel.split("/")
+    if len(parts) <= 2:
+        return "unknown", rel
+    return parts[1], "/".join(parts[2:]).rsplit(".jsonl", 1)[0]
+
+
 def _grouped(root: str, key: str):
     """Ledger entries grouped for reporting."""
     groups = OrderedDict()  # type: Dict[str, list]
     for rel, entries in sorted(repoledger.read_all(root).items()):
-        parts = rel.split("/")
-        who = parts[1] if len(parts) > 2 else "unknown"
-        branch = "/".join(parts[2:]).rsplit(".jsonl", 1)[0] if len(parts) > 2 else rel
+        who, branch = _ledger_scope(rel)
         for entry in entries:
             if key == "identity":
                 name = who
@@ -284,6 +303,164 @@ def cmd_rollup(args) -> int:
         print("%-*s %8d %10.2f" % (width, name, len(entries), total))
     print("-" * (width + 20))
     print("%-*s %8s %10.2f  %s" % (width, "TOTAL", "", grand, currency))
+    return 0
+
+
+def _commit_index(root: str, branch: str):
+    """`branch`'s history, indexed by first parent.
+
+    An entry records the sha of HEAD *before* its commit, because pre-commit
+    runs while the new sha does not yet exist (see hook_pre_commit). Getting
+    back to the commit therefore means inverting that: the commit whose first
+    parent is the recorded one. The root commit has no parent and is filed
+    under "ROOT", which is what an entry written before the first commit
+    carries as `parent: null`.
+
+    --first-parent because it is the chain of commits actually *made* on this
+    branch, which is the same set the branch's ledger file records. It is also
+    linear, so no two commits can share a first parent and the index is
+    unambiguous.
+
+    Returns (index, commit_count). The count comes free from this walk and is
+    what the coverage line reports against.
+    """
+    try:
+        out = subprocess.run(
+            ["git", "log", "--first-parent", "--format=%H%x00%P%x00%cI%x00%s",
+             branch],
+            cwd=root, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+    except (OSError, subprocess.SubprocessError):
+        return {}, 0
+    if out.returncode != 0:
+        return {}, 0            # no such branch, or no commits yet
+
+    index = {}
+    count = 0
+    for line in out.stdout.decode("utf-8", "replace").split("\n"):
+        if not line.strip():
+            continue
+        fields = line.split("\0")
+        if len(fields) < 4:
+            continue
+        sha, parents, when, subject = fields[0], fields[1], fields[2], fields[3]
+        key = parents.split()[0] if parents.strip() else "ROOT"
+        # `git log` walks newest-first, so `count` doubles as a position: a
+        # higher number is older, which is what puts the table in order.
+        index[key] = (sha, subject, when, count)
+        count += 1
+    return index, count
+
+
+def _coverage(recorded: int, commits: int, orphans: int) -> str:
+    """How much of the branch the breakdown below actually accounts for.
+
+    Without this the table is silently partial in two directions at once --
+    commits with no entry are omitted, and orphaned entries name no commit --
+    and a list of shas and subjects reads as though it were the whole story.
+    """
+    text = "%d of %d commit%s %s recorded usage" % (
+        recorded, commits, "" if commits == 1 else "s",
+        "has" if recorded == 1 else "have")
+    if orphans:
+        text += "; %d entr%s orphaned by rebase or amend" % (
+            orphans, "y" if orphans == 1 else "ies")
+    return text
+
+
+def cmd_log(args) -> int:
+    """Per-commit cost for one branch, from the tracked ledger.
+
+    Unlike `tkus show`, this reads the ledger committed to the repository, so
+    it works in any clone -- not only on the machine that made the commits.
+    """
+    root = repo_root()
+    branch = args.branch or repoledger.branch_name(root)
+
+    entries = []
+    for rel, items in sorted(repoledger.read_all(root).items()):
+        # Every identity's file for this branch: `rollup --by branch` sums
+        # across people, and a branch two people worked on is one branch.
+        if _ledger_scope(rel)[1] == branch:
+            entries.extend(items)
+
+    index, commit_count = _commit_index(root, branch)
+
+    commits = {}
+    orphaned = []
+    currency = "USD"
+    for entry in entries:
+        usd = float(entry.get("usd") or 0.0)
+        currency = entry.get("currency", currency)
+        # "HEAD" appears in ledgers written before head_sha checked git's exit
+        # code: on an unborn branch it recorded that string instead of null.
+        # It meant the root commit then and it means the root commit now.
+        parent = entry.get("parent")
+        found = index.get("ROOT" if parent in (None, "HEAD") else parent)
+        if not found:
+            orphaned.append({"parent": entry.get("parent"),
+                             "at": entry.get("until") or entry.get("at"),
+                             "usd": usd})
+            continue
+        sha, subject, when, order = found
+        row = commits.get(sha)
+        if row:
+            row["usd"] += usd       # two entries can land on one commit
+        else:
+            commits[sha] = {"sha": sha, "subject": subject, "at": when,
+                            "usd": usd, "order": order}
+
+    ordered = sorted(commits.values(), key=lambda r: -r["order"])
+    orphan_total = sum(o["usd"] for o in orphaned)
+    total = sum(r["usd"] for r in ordered) + orphan_total
+
+    if not entries:
+        # stdout stays machine-readable, so the note goes to stderr whenever
+        # something is parsing us.
+        out = sys.stderr if (args.total or args.json) else sys.stdout
+        out.write("no committed ledger entries for %s under %s/\n"
+                  % (branch, repoledger.LEDGER_DIR))
+        if repoledger.is_ignored(root):
+            out.write("(%s is in .gitignore, so cost is recorded locally only "
+                      "-- see `tkus show`)\n" % repoledger.LEDGER_DIR)
+        elif not repoledger.enabled(RateTable.load(root)):
+            out.write("(running --local-only, so cost is recorded in .git/ only "
+                      "-- see `tkus show`)\n")
+        if not (args.total or args.json):
+            return 0
+
+    if args.json:
+        print(json.dumps({
+            "branch": branch,
+            "currency": currency,
+            "total": total,
+            "commits": [{"sha": r["sha"], "subject": r["subject"],
+                         "at": r["at"], "usd": r["usd"]} for r in ordered],
+            "orphaned": orphaned,
+        }, indent=2, sort_keys=True))
+        return 0
+
+    if args.total:
+        print(_money(total))
+        return 0
+
+    print("branch %s" % branch)
+    print(_coverage(len(ordered), commit_count, len(orphaned)))
+    print()
+
+    rule = min(shutil.get_terminal_size((80, 24)).columns, 100)
+    room = max(20, rule - 23)
+    print("%-9s %10s  %s" % ("commit", "cost", "subject"))
+    print("-" * rule)
+    for row in ordered:
+        subject = row["subject"]
+        if len(subject) > room:
+            subject = subject[:room - 3] + "..."
+        print("%-9s %10.2f  %s" % (row["sha"][:9], row["usd"], subject))
+    if orphaned:
+        print("%-9s %10.2f  (orphaned: no commit on this branch claims these)"
+              % ("--", orphan_total))
+    print("-" * rule)
+    print("%-9s %10.2f  %s" % ("TOTAL", total, currency))
     return 0
 
 
@@ -808,6 +985,15 @@ def build_parser() -> argparse.ArgumentParser:
     rollup.add_argument("--by", choices=("branch", "identity", "date"),
                         default="branch")
     rollup.set_defaults(func=cmd_rollup)
+
+    log = sub.add_parser("log", help="per-commit cost for one branch")
+    log.add_argument("--branch", metavar="NAME",
+                     help="branch to report on (default: the current one)")
+    log.add_argument("--total", action="store_true",
+                     help="print only the total, for scripting")
+    log.add_argument("--json", action="store_true",
+                     help="machine-readable output")
+    log.set_defaults(func=cmd_log)
 
     reprice = sub.add_parser("reprice",
                              help="re-price the ledger with the current rates")

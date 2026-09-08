@@ -295,11 +295,58 @@ transcript store.
 | `tkus uninstall` | Remove them, restoring any displaced hooks |
 | `tkus report [--all]` | Usage not yet attributed to a commit |
 | `tkus rollup [--by branch\|identity\|date]` | Totals from the tracked ledger |
+| `tkus log [--branch N] [--total]` | Per-commit cost for one branch |
 | `tkus reprice` | Re-price the ledger with the current rate table |
 | `tkus show [<commit>]` | Per-commit detail from the local `.git/` ledger |
 | `tkus rates [--at DATE] [--json]` | The rate table used for pricing |
 | `tkus rates --check` | Compare against the installed Claude Code; exit 1 on drift |
 | `tkus rates --update [--yes]` | Write refreshed rates to the global override |
+
+### What a branch cost, commit by commit
+
+`tkus rollup` gives a branch one row. `tkus log` breaks that row into the
+commits it came from, reading the tracked ledger — so unlike `tkus show`, it
+works in any clone, not only on the machine that made the commits.
+
+```
+$ tkus log
+branch main
+7 of 8 commits have recorded usage; 2 entries orphaned by rebase or amend
+
+commit          cost  subject
+--------------------------------------------------------------------------------
+d260dd940      17.50  Fix the version so upgrades work, and stop report from...
+73965dfd4       4.12  Price the eight models that were silently costing zero
+e52cde168       3.96  Stop Sonnet 5 from jumping 50% on September 1
+--              5.51  (orphaned: no commit on this branch claims these)
+--------------------------------------------------------------------------------
+TOTAL          43.38  USD
+```
+
+`--branch NAME` reports on a branch other than the current one, `--total` prints
+just the number for scripting, and `--json` emits the same data structured.
+
+The scope is the branch's **own** entries — the same figure as its row in `tkus
+rollup`. Work that arrived through a merge stays attributed to the branch it was
+written on, so summing every branch double-counts nothing.
+
+#### The total is exact; the per-commit attribution is best-effort
+
+An entry is written in `pre-commit`, when the new commit's SHA does not yet
+exist, so it records the **parent** instead. Getting back to the commit means
+inverting that — and history rewriting breaks the pointer: a rebase gives the
+commit a different parent, and amending after further agent work strands the
+entry written during the amend on a commit that no longer exists.
+
+Those entries are still real money, so they are counted in `TOTAL` and shown on
+their own line rather than dropped. **`TOTAL` therefore always agrees with the
+branch's `rollup` row**, whatever git has done to the history.
+
+The coverage line is how you judge the breakdown: it reports how many of the
+branch's commits carry usage at all — commits made before `tkus install`, or
+with no agent usage, are simply absent from the table — and how many entries
+have been orphaned. In a repository that rebases often, expect the orphaned
+share to grow.
 
 ### Seeing the rates
 
@@ -387,6 +434,7 @@ hooks wrote:
 |---|---|---|
 | `tkus report` | The agents' transcripts, live | No |
 | `tkus rollup` | The tracked `.tkus/` ledger | Yes |
+| `tkus log` | The tracked `.tkus/` ledger | Yes |
 | `tkus show` | The local `.git/` ledger | Yes |
 
 So `report` showing a large figure while `rollup` shows nothing is the expected
