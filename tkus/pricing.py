@@ -111,9 +111,9 @@ class RateTable:
     def canonical(self, model: str) -> str:
         return self.data.get("aliases", {}).get(model, model)
 
-    def rate_for(self, model: str, speed: str, when: datetime):
-        # type: (...) -> Optional[Tuple[float, float]]
-        """(input, output) USD per MTok for a model at a point in time."""
+    def window_for(self, model: str, speed: str, when: datetime):
+        # type: (...) -> Optional[dict]
+        """The price window in effect for a model at a point in time."""
         entry = self.data.get("models", {}).get(self.canonical(model))
         if not entry:
             return None
@@ -126,8 +126,45 @@ class RateTable:
                 continue
             if end and day > end:
                 continue
-            return (float(window["input"]), float(window["output"]))
+            return window
         return None
+
+    def rate_for(self, model: str, speed: str, when: datetime):
+        # type: (...) -> Optional[Tuple[float, float]]
+        """(input, output) USD per MTok for a model at a point in time."""
+        window = self.window_for(model, speed, when)
+        if window is None:
+            return None
+        return (float(window["input"]), float(window["output"]))
+
+    # The order these are resolved and applied in, everywhere.
+    CACHE_FIELDS = (("cache_write_1h", 2.0), ("cache_write_5m", 1.25),
+                    ("cache_read", 0.1))
+
+    def cache_rates(self, model: str, speed: str, when: datetime):
+        # type: (...) -> Optional[Tuple[float, float, float]]
+        """Absolute (1h write, 5m write, read) USD per MTok for a model.
+
+        Cache prices are normally a fixed multiple of the input rate, which is
+        why the table stores three multipliers rather than repeating three more
+        numbers per model. A window may name an absolute price for any of them,
+        overriding the multiple.
+
+        That escape hatch is not hypothetical: Fable 5.1 and Mythos 5.1 price
+        cache reads at $0.25/MTok against a $10 input rate -- 0.025x, where
+        every other model is 0.1x. Deriving them would overstate cached reads
+        fourfold, and cached reads dominate real agent usage.
+        """
+        window = self.window_for(model, speed, when)
+        if window is None:
+            return None
+        rate_in = float(window["input"])
+        explicit = window.get("cache") or {}
+        return tuple(
+            float(explicit[name]) if name in explicit
+            else rate_in * self.multiplier(name, default)
+            for name, default in self.CACHE_FIELDS
+        )
 
     def multiplier(self, name: str, default: float) -> float:
         return float(self.data.get("multipliers", {}).get(name, default))
@@ -194,9 +231,6 @@ def compute_cost(records, table, when=None):
     for record in records:
         buckets.setdefault((record.provider,) + record.rate_key, []).append(record)
 
-    cw1h = table.multiplier("cache_write_1h", 2.0)
-    cw5m = table.multiplier("cache_write_5m", 1.25)
-    cread = table.multiplier("cache_read", 0.1)
     search_rate = table.web_search_per_1k()
     aiu_rate = table.usd_per_aiu()
 
@@ -210,11 +244,12 @@ def compute_cost(records, table, when=None):
         # cost and are not on an unbilled endpoint. Looking it up regardless
         # would flag a model as "unpriced" even when nothing needed pricing.
         needs_rate = any(r.nano_aiu is None and not r.unbilled for r in group)
-        rate = None
+        rate = cache = None
         if needs_rate:
             # Price each bucket at the rates in effect for its own window.
             stamp = when or max(r.timestamp for r in group)
             rate = table.rate_for(model, speed, stamp)
+            cache = table.cache_rates(model, speed, stamp)
             if rate is None:
                 # Never price an unknown model as zero -- that silently undercounts.
                 unpriced.add(model)
@@ -231,12 +266,13 @@ def compute_cost(records, table, when=None):
                 continue
             elif rate is not None:
                 rate_in, rate_out = rate
+                cw1h, cw5m, cread = cache
                 subtotal += (
                     r.input_tokens * rate_in
                     + r.output_tokens * rate_out
-                    + r.cache_write_1h * rate_in * cw1h
-                    + r.cache_write_5m * rate_in * cw5m
-                    + r.cache_read * rate_in * cread
+                    + r.cache_write_1h * cw1h
+                    + r.cache_write_5m * cw5m
+                    + r.cache_read * cread
                 ) / 1_000_000.0 * tier_mult
 
         key = (provider, model)
@@ -265,9 +301,6 @@ def compute_cost_from_totals(totals_by_model, table, when):
         rates_version=table.version,
         overridden=table.is_overridden,
     )
-    cw1h = table.multiplier("cache_write_1h", 2.0)
-    cw5m = table.multiplier("cache_write_5m", 1.25)
-    cread = table.multiplier("cache_read", 0.1)
     search_rate = table.web_search_per_1k()
     aiu_rate = table.usd_per_aiu()
 
@@ -288,12 +321,13 @@ def compute_cost_from_totals(totals_by_model, table, when):
                 unpriced.add(t.model)
             else:
                 rate_in, rate_out = rate
+                cw1h, cw5m, cread = table.cache_rates(t.model, "standard", when)
                 subtotal += (
                     t.input_tokens * rate_in
                     + t.output_tokens * rate_out
-                    + t.cache_write_1h * rate_in * cw1h
-                    + t.cache_write_5m * rate_in * cw5m
-                    + t.cache_read * rate_in * cread
+                    + t.cache_write_1h * cw1h
+                    + t.cache_write_5m * cw5m
+                    + t.cache_read * cread
                 ) / 1_000_000.0
         # Other providers with no recorded AIU are unbilled endpoints: zero.
 

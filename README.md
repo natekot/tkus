@@ -355,6 +355,23 @@ table expresses cache prices as multipliers on the input rate; this resolves
 them into money, because what matters when checking an invoice is that a cache
 read costs $0.50/MTok, not that it is 0.1x something else.
 
+Where that multiple does not hold, a price window says so outright and the
+explicit figure wins:
+
+```json
+"claude-fable-5-1": {
+  "standard": [{"from": null, "until": null, "input": 10.0, "output": 50.0,
+                "cache": {"cache_read": 0.25}}]
+}
+```
+
+Fable 5.1 and Mythos 5.1 are the models that need it: they price cache reads at
+$0.25/MTok against a $10 input rate — 0.025x, where every other model is 0.1x.
+Deriving those would overstate cached reads **fourfold**, and cached reads
+dominate real agent usage. The `cache` key is per field, so anything left out
+of it is still derived; `tkus rates --check` reports a tier whose cache prices
+the table neither states nor derives correctly.
+
 ```
 USD per 1M tokens
 model             speed        input    output  cache-wr-1h  cache-wr-5m   cache-rd
@@ -410,6 +427,10 @@ express them:
 | A model you already override locally | Almost certainly a negotiated rate; a list price must not undo it |
 | A dated window (e.g. introductory pricing) | The catalog carries no dates, so it cannot tell a price change from a promotion still running |
 | `fast` pricing | The catalog has no speed dimension at all |
+
+Cache pricing is *not* on that list. The catalog states it per tier, so a model
+added on a tier where the usual multiple does not hold is written with an
+explicit `cache` key rather than a derived — and wrong — one.
 
 When a price does change, the old window is **closed** rather than rewritten, so
 `tkus reprice` keeps historical commits at the rates that actually applied.

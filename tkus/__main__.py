@@ -561,7 +561,6 @@ def _rate_rows(table, when):
     else -- so the multipliers are resolved into money here.
     """
     rows = []
-    mult = (("cache_write_1h", 2.0), ("cache_write_5m", 1.25), ("cache_read", 0.1))
     for model, entry in (table.data.get("models") or {}).items():
         for speed in entry:
             rate = table.rate_for(model, speed, when)
@@ -569,11 +568,12 @@ def _rate_rows(table, when):
                 continue          # priced only outside this date
             inp, out = rate
             row = {"model": model, "speed": speed, "input": inp, "output": out}
-            for name, default in mult:
+            cache = table.cache_rates(model, speed, when)
+            for (name, _default), value in zip(table.CACHE_FIELDS, cache):
                 # Rounded because 3.0 * 0.1 is 0.30000000000000004, which is
                 # correct and unreadable. Ten places is far below the precision
                 # of any published rate, so nothing real is lost.
-                row[name] = round(inp * table.multiplier(name, default), 10)
+                row[name] = round(value, 10)
             rows.append(row)
     return rows
 
@@ -721,6 +721,24 @@ def _override_path() -> str:
     return os.path.join(_global_config_dir(), "rates.json")
 
 
+def _explicit_cache(table, tier_prices, rate_in):
+    """Cache prices this input rate cannot derive, as an override.
+
+    Only the ones that actually deviate: writing out a number the multiplier
+    already produces would repeat three fields on every model to say nothing.
+    Without this, adding a model on a tier like tier_10_50_cache_read_0_25
+    would quietly price its cache reads at four times the real rate.
+    """
+    out = OrderedDict()
+    for name, default in table.CACHE_FIELDS:
+        upstream = tier_prices.get(name)
+        if upstream is None:
+            continue
+        if abs(rate_in * table.multiplier(name, default) - upstream) > 1e-9:
+            out[name] = upstream
+    return out
+
+
 def _build_update(table, data, drift, when, existing):
     """The override to write, plus everything deliberately left alone.
 
@@ -748,9 +766,14 @@ def _build_update(table, data, drift, when, existing):
         if name in existing_models:
             skipped.append((name, "already overridden locally"))
             continue
-        models[name] = {"standard": [{"from": None, "until": None,
-                                      "input": entry["input"],
-                                      "output": entry["output"]}]}
+        window = OrderedDict([("from", None), ("until", None),
+                              ("input", entry["input"]),
+                              ("output", entry["output"])])
+        cache = _explicit_cache(table, data["tiers"].get(entry["tier"]) or {},
+                                entry["input"])
+        if cache:
+            window["cache"] = cache
+        models[name] = {"standard": [window]}
 
     by_model = OrderedDict()
     for change in drift["changed"]:

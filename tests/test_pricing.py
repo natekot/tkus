@@ -259,3 +259,86 @@ class TestTotalsPricing(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestExplicitCachePrices(unittest.TestCase):
+    """A window may state a cache price outright instead of deriving it.
+
+    The multipliers hold for every model but two: Fable 5.1 and Mythos 5.1
+    price cache reads at 0.025x input where everything else is 0.1x. Deriving
+    those would overstate cached reads fourfold, on the token category that
+    dominates real agent usage.
+    """
+
+    def setUp(self):
+        self.table = RateTable({
+            "version": "test", "currency": "USD",
+            "multipliers": {"cache_write_1h": 2.0, "cache_write_5m": 1.25,
+                            "cache_read": 0.1},
+            "models": {
+                "derived": {"standard": [
+                    {"from": None, "until": None, "input": 10.0, "output": 50.0}]},
+                "explicit": {"standard": [
+                    {"from": None, "until": None, "input": 10.0, "output": 50.0,
+                     "cache": {"cache_read": 0.25}}]},
+            },
+        })
+
+    def test_without_an_override_cache_is_still_a_multiple_of_input(self):
+        self.assertEqual(self.table.cache_rates("derived", "standard", at("2026-09-08")),
+                         (20.0, 12.5, 1.0))
+
+    def test_an_explicit_price_replaces_the_derived_one(self):
+        self.assertEqual(self.table.cache_rates("explicit", "standard", at("2026-09-08")),
+                         (20.0, 12.5, 0.25))
+
+    def test_fields_left_out_of_the_override_are_still_derived(self):
+        """The override is per field, not all-or-nothing: only cache_read moved."""
+        cw1h, cw5m, _ = self.table.cache_rates("explicit", "standard", at("2026-09-08"))
+        self.assertEqual((cw1h, cw5m), (20.0, 12.5))
+
+    def test_the_override_reaches_the_price(self):
+        cost = compute_cost(
+            [record(model="explicit", cache_read=MTOK)], self.table)
+        self.assertAlmostEqual(cost.total, 0.25, places=6)
+
+    def test_the_override_reaches_a_reprice_too(self):
+        """`tkus reprice` goes through the totals path, which must not diverge."""
+        totals = {("test", "explicit"): ModelTotals(
+            provider="claude-code", model="explicit", cache_read=MTOK)}
+        cost = compute_cost_from_totals(totals, self.table, at("2026-09-08"))
+        self.assertAlmostEqual(cost.total, 0.25, places=6)
+
+    def test_deriving_it_would_have_been_four_times_too_much(self):
+        """The size of the mistake this exists to prevent."""
+        cost = compute_cost([record(model="derived", cache_read=MTOK)], self.table)
+        self.assertAlmostEqual(cost.total, 1.0, places=6)
+
+
+class TestBundledFiveOneModels(unittest.TestCase):
+    """The two models that forced the escape hatch, as actually shipped."""
+
+    def setUp(self):
+        self.table = RateTable.load(None)
+
+    def test_fable_5_1_prices_cache_reads_at_a_quarter(self):
+        cost = compute_cost(
+            [record(model="claude-fable-5-1", cache_read=MTOK)], self.table)
+        self.assertAlmostEqual(cost.total, 0.25, places=6)
+
+    def test_fable_5_is_unchanged_and_still_derives(self):
+        """The point release is a different model, not an alias of the old one."""
+        cost = compute_cost(
+            [record(model="claude-fable-5", cache_read=MTOK)], self.table)
+        self.assertAlmostEqual(cost.total, 1.0, places=6)
+
+    def test_mythos_5_1_prices_cache_reads_at_a_quarter(self):
+        cost = compute_cost(
+            [record(model="claude-mythos-5-1", cache_read=MTOK)], self.table)
+        self.assertAlmostEqual(cost.total, 0.25, places=6)
+
+    def test_input_and_output_are_unaffected(self):
+        cost = compute_cost(
+            [record(model="claude-fable-5-1", input_tokens=MTOK,
+                    output_tokens=MTOK)], self.table)
+        self.assertAlmostEqual(cost.total, 60.0, places=6)

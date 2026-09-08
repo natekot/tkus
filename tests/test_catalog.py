@@ -165,6 +165,56 @@ class TestMultiplierConflicts(CatalogTestCase):
         self.assertEqual(conflicts[0]["actual"], 0.9)
         self.assertEqual(conflicts[0]["expected"], 0.2)
 
+    def _deviating(self):
+        """A catalog whose tier_a cache_read is 0.9 where 0.2 is implied."""
+        tiers = dict(TIERS, tier_a=(2, 8, 2.5, 4, 0.9))
+        return catalog.extract(write_blob(self.tmp, tiers=tiers))
+
+    def _table(self, **models):
+        return RateTable({
+            "version": "test", "currency": "USD",
+            "multipliers": {"cache_write_1h": 2.0, "cache_write_5m": 1.25,
+                            "cache_read": 0.1},
+            "models": models,
+        })
+
+    def test_stating_the_price_outright_settles_the_conflict(self):
+        """The escape hatch working is not the assumption breaking. Once every
+        model on the tier names the price, nothing is being derived wrongly."""
+        priced = {"standard": [{"from": None, "until": None,
+                                "input": 2.0, "output": 8.0,
+                                "cache": {"cache_read": 0.9}}]}
+        table = self._table(**{"claude-alpha-1": priced, "claude-alpha-2": priced})
+        self.assertEqual(catalog.multiplier_conflicts(self._deviating(), table), [])
+
+    def test_one_model_left_deriving_still_reports(self):
+        """Silence must require *every* model on the tier, not just one."""
+        table = self._table(**{
+            "claude-alpha-1": {"standard": [{"from": None, "until": None,
+                                             "input": 2.0, "output": 8.0,
+                                             "cache": {"cache_read": 0.9}}]},
+            "claude-alpha-2": {"standard": [{"from": None, "until": None,
+                                             "input": 2.0, "output": 8.0}]},
+        })
+        conflicts = catalog.multiplier_conflicts(self._deviating(), table)
+        self.assertEqual(len(conflicts), 1)
+        self.assertEqual(conflicts[0]["models"], ["claude-alpha-1", "claude-alpha-2"])
+
+    def test_an_override_that_states_the_wrong_price_still_reports(self):
+        table = self._table(**{
+            "claude-alpha-1": {"standard": [{"from": None, "until": None,
+                                             "input": 2.0, "output": 8.0,
+                                             "cache": {"cache_read": 0.5}}]},
+            "claude-alpha-2": {"standard": [{"from": None, "until": None,
+                                             "input": 2.0, "output": 8.0,
+                                             "cache": {"cache_read": 0.5}}]},
+        })
+        self.assertEqual(len(catalog.multiplier_conflicts(self._deviating(), table)), 1)
+
+    def test_a_model_the_table_has_never_heard_of_still_reports(self):
+        self.assertEqual(
+            len(catalog.multiplier_conflicts(self._deviating(), self._table())), 1)
+
 
 class TestBinaryDiscovery(CatalogTestCase):
     def test_env_override_wins(self):
@@ -484,3 +534,39 @@ class TestPinnedRates(unittest.TestCase):
             rows = json.loads(out.stdout.decode())["models"]
             sonnet = [r for r in rows if r["model"] == "claude-sonnet-5"][0]
             self.assertEqual(sonnet["input"], 2.0, "wrong on %s" % date)
+
+
+class TestUpdateWritesExplicitCache(CatalogTestCase):
+    """`--update` must not add a model priced by a multiplier that is wrong.
+
+    The catalog can express a deviating cache price, so the refusal list does
+    not apply -- writing the derived value would be writing a known error.
+    """
+
+    def _proposal(self, table):
+        from datetime import datetime, timezone
+        from tkus.__main__ import _build_update, _rate_drift
+        tiers = dict(TIERS, tier_a=(2, 8, 2.5, 4, 0.9))   # cache_read implies 0.2
+        data = catalog.extract(write_blob(self.tmp, tiers=tiers))
+        when = datetime.now(timezone.utc)
+        return _build_update(table, data, _rate_drift(table, data, when), when, {})
+
+    def test_a_deviating_cache_price_is_written_out(self):
+        table = RateTable({"version": "test", "currency": "USD",
+                           "multipliers": {"cache_write_1h": 2.0,
+                                           "cache_write_5m": 1.25,
+                                           "cache_read": 0.1},
+                           "models": {}})
+        models = self._proposal(table)[0]["models"]
+        window = models["claude-alpha-1"]["standard"][0]
+        self.assertEqual(window["cache"], {"cache_read": 0.9})
+
+    def test_a_conforming_tier_gets_no_cache_key(self):
+        """Silence where the multiplier is right, so models stay terse."""
+        table = RateTable({"version": "test", "currency": "USD",
+                           "multipliers": {"cache_write_1h": 2.0,
+                                           "cache_write_5m": 1.25,
+                                           "cache_read": 0.1},
+                           "models": {}})
+        models = self._proposal(table)[0]["models"]
+        self.assertNotIn("cache", models["claude-gamma-1"]["standard"][0])

@@ -229,13 +229,24 @@ def aliases(catalog: dict) -> Dict[str, str]:
 
 
 def multiplier_conflicts(catalog: dict, table) -> List[dict]:
-    """Tiers whose cache prices are not the table's multipliers on input.
+    """Tiers whose cache prices the table does not reproduce.
 
     `rates.json` stores cache pricing as three global multipliers, which is only
     valid while every model agrees. The catalog prices each tier explicitly, so
     it can prove that assumption -- or catch the release where it stops holding,
-    which would otherwise mispriced every cached token silently.
+    which would otherwise misprice every cached token silently.
+
+    A tier is not a conflict once every model on it names the price outright:
+    that is the escape hatch working, not the assumption breaking. Only a tier
+    the table still derives *and* gets wrong is reported.
     """
+    from datetime import datetime, timezone
+    when = datetime.now(timezone.utc)
+
+    on_tier = {}  # type: dict
+    for entry in catalog.get("models") or []:
+        on_tier.setdefault(entry["tier"], []).append(entry["id"])
+
     out = []
     for name in ("cache_write_1h", "cache_write_5m", "cache_read"):
         factor = table.multiplier(name, {"cache_write_1h": 2.0,
@@ -244,7 +255,22 @@ def multiplier_conflicts(catalog: dict, table) -> List[dict]:
         for tier, prices in sorted(catalog["tiers"].items()):
             expected = prices["input"] * factor
             actual = prices[name]
-            if abs(expected - actual) > 1e-9:
-                out.append({"tier": tier, "field": name,
-                            "expected": expected, "actual": actual})
+            if abs(expected - actual) <= 1e-9:
+                continue
+            models = on_tier.get(tier) or []
+            if models and all(_prices_cache(table, model, name, actual, when)
+                              for model in models):
+                continue          # stated explicitly, so nothing is derived wrong
+            out.append({"tier": tier, "field": name,
+                        "expected": expected, "actual": actual,
+                        "models": sorted(models)})
     return out
+
+
+def _prices_cache(table, model: str, field: str, upstream: float, when) -> bool:
+    """True when the table already reproduces `upstream` for this model."""
+    rates = table.cache_rates(model, "standard", when)
+    if rates is None:
+        return False
+    index = [name for name, _ in table.CACHE_FIELDS].index(field)
+    return abs(rates[index] - upstream) <= 1e-9
