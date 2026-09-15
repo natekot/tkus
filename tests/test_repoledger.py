@@ -122,6 +122,50 @@ class TestCommitMessagesAreUntouched(RepoLedgerTestCase):
         self.assertEqual(self.git("status", "--porcelain").strip(), "")
 
 
+class TestLinkedWorktree(RepoLedgerTestCase):
+    """Git runs hooks from the common git dir, so one install covers every
+    worktree. tkus used to look in the per-worktree git dir instead."""
+
+    def setUp(self):
+        super().setUp()
+        self.commit("base")
+        self.main = self.repo
+        self.repo = os.path.join(self.tmp, "wt")
+        self.git("worktree", "add", "-q", "-b", "feature", self.repo,
+                 cwd=self.main)
+
+    def test_counts_as_installed_without_reinstalling(self):
+        self.assertTrue(hooks.is_installed(self.repo))
+
+    def test_commit_records_without_reinstalling(self):
+        self.inject_usage()
+        self.commit("in worktree")
+        self.assertEqual(len(self.entries()), 1)
+        self.assertTrue(os.path.exists(
+            os.path.join(cursor.git_dir(self.repo), "tkus", "cursor.json")))
+
+    def test_install_writes_the_hooks_git_runs(self):
+        hooks.install(self.repo)
+        for name in hooks.HOOKS:
+            self.assertFalse(os.path.exists(
+                os.path.join(cursor.git_dir(self.repo), "hooks", name)))
+            self.assertTrue(os.path.exists(
+                os.path.join(self.main, ".git", "hooks", name)))
+
+    def test_install_removes_hooks_an_earlier_version_left_in_the_worktree(self):
+        stray = os.path.join(cursor.git_dir(self.repo), "hooks")
+        os.makedirs(stray)
+        for name in hooks.HOOKS:
+            with open(os.path.join(stray, name), "w") as fh:
+                fh.write("#!/bin/sh\n%s\n" % hooks.MARKER)
+        hooks.install(self.repo)
+        self.assertEqual(os.listdir(stray), [])
+
+    def test_uninstall_removes_the_shared_hooks(self):
+        hooks.uninstall(self.repo)
+        self.assertFalse(hooks.is_installed(self.main))
+
+
 class TestSquash(RepoLedgerTestCase):
     def test_entries_survive_a_squash_merge(self):
         """The entire reason for this design. Squash discards commit messages
@@ -461,11 +505,11 @@ class TestReportWithoutInstall(RepoLedgerTestCase):
 
     def test_partial_install_still_counts_as_not_installed(self):
         """One hook missing means recording is broken, not merely degraded."""
-        os.remove(os.path.join(cursor.git_dir(self.repo), "hooks", "pre-commit"))
+        os.remove(os.path.join(hooks.hooks_path(self.repo), "pre-commit"))
         self.assertFalse(hooks.is_installed(self.repo))
 
     def test_a_foreign_hook_does_not_count_as_installed(self):
-        directory = os.path.join(cursor.git_dir(self.repo), "hooks")
+        directory = hooks.hooks_path(self.repo)
         for name in hooks.HOOKS:
             with open(os.path.join(directory, name), "w") as fh:
                 fh.write("#!/bin/sh\necho someone elses hook\n")

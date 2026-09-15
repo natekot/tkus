@@ -52,8 +52,30 @@ def _interpreter(python: str) -> str:
     return (python or "python3").replace("\\", "/")
 
 
+def common_dir(repo_root: str) -> str:
+    """The git directory shared by every worktree of the repository.
+
+    Git runs hooks from here, not from the per-worktree git dir, so a linked
+    worktree is covered by the hooks its main checkout already has.
+    """
+    out = subprocess.check_output(
+        ["git", "rev-parse", "--git-common-dir"], cwd=repo_root
+    ).decode().strip()
+    # Relative in the main checkout (`.git`), absolute from a linked worktree.
+    return os.path.normpath(os.path.join(repo_root, out))
+
+
+def hooks_path(repo_root: str) -> str:
+    return os.path.join(common_dir(repo_root), "hooks")
+
+
+def _is_linked_worktree(repo_root: str) -> bool:
+    return (os.path.realpath(git_dir(repo_root))
+            != os.path.realpath(common_dir(repo_root)))
+
+
 def _hooks_dir(repo_root: str) -> str:
-    path = os.path.join(git_dir(repo_root), "hooks")
+    path = hooks_path(repo_root)
     if not os.path.isdir(path):
         os.makedirs(path)
     return path
@@ -89,9 +111,27 @@ def _remove_legacy(directory: str) -> List[str]:
     return notes
 
 
+def _remove_stray(repo_root: str) -> List[str]:
+    """Drop hooks an earlier tkus wrote into a linked worktree's own git dir.
+
+    Git never runs hooks from there, so they did nothing -- but they would
+    otherwise sit around looking like a second, independent install.
+    """
+    if not _is_linked_worktree(repo_root):
+        return []
+    directory = os.path.join(git_dir(repo_root), "hooks")
+    notes = []
+    for name in HOOKS + LEGACY_HOOKS:
+        path = os.path.join(directory, name)
+        if os.path.exists(path) and _is_ours(path):
+            os.remove(path)
+            notes.append("removed unused %s from this worktree's git dir" % name)
+    return notes
+
+
 def is_installed(repo_root: str) -> bool:
     """True when every hook tkus needs is present and managed by us."""
-    directory = os.path.join(git_dir(repo_root), "hooks")
+    directory = hooks_path(repo_root)
     return all(_is_ours(os.path.join(directory, name)) for name in HOOKS)
 
 
@@ -99,7 +139,7 @@ def install(repo_root: str, python: str = None) -> List[str]:
     """Install both hooks. Returns human-readable notes about what happened."""
     python = python or sys.executable or "python3"
     directory = _hooks_dir(repo_root)
-    notes = _remove_legacy(directory)
+    notes = _remove_stray(repo_root) + _remove_legacy(directory)
 
     custom_path = subprocess.run(
         ["git", "config", "--get", "core.hooksPath"],
@@ -133,12 +173,18 @@ def install(repo_root: str, python: str = None) -> List[str]:
         _make_executable(path)
         notes.append("installed %s" % name)
 
+    if _is_linked_worktree(repo_root):
+        notes.append("hooks are shared by every worktree of this repository; "
+                     "other worktrees need no install of their own")
     return notes
 
 
 def uninstall(repo_root: str) -> List[str]:
     directory = _hooks_dir(repo_root)
-    notes = _remove_legacy(directory)
+    notes = _remove_stray(repo_root) + _remove_legacy(directory)
+    if _is_linked_worktree(repo_root):
+        notes.append("hooks are shared by every worktree of this repository, "
+                     "so this uninstalls tkus from all of them")
     for name in HOOKS:
         path = os.path.join(directory, name)
         if not os.path.exists(path):

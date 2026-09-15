@@ -134,6 +134,11 @@ Two hooks are written:
 `<name>.local` and still runs first; if it fails, the commit aborts exactly as
 before.
 
+**One install covers every worktree.** Git runs hooks from the repository's
+shared git directory, so a worktree made with `git worktree add` records from
+its first commit. Each worktree keeps its own cursor. Running `tkus uninstall`
+from any worktree removes the hooks from all of them.
+
 ### 3. Verify
 
 ```sh
