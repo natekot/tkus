@@ -614,6 +614,12 @@ per-developer spend visible to everyone with repository access.
 - **Long gaps.** A commit made after days of uncommitted work absorbs all of it.
 - **Interleaved branches** share one repository-level cursor, so usage lands on
   whichever branch commits first.
+- **Branch renames split a branch's ledger.** The ledger file is named after
+  the branch, so after `git branch -m old new` the next commit starts
+  `new.jsonl` and `old.jsonl` stays behind. Nothing is lost or double-counted,
+  but `tkus rollup` shows two rows, and `tkus log --branch old` reports the
+  pre-rename entries as orphaned because the `old` ref no longer exists.
+  To merge them by hand, move the old file's lines into the new one and commit.
 - **Windows code paths are tested but have not been run on Windows.**
 
 ### Other agents
