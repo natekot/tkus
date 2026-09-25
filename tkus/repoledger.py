@@ -75,10 +75,49 @@ def branch_name(repo_root: str) -> str:
     value = _git(repo_root, ["symbolic-ref", "--short", "HEAD"])
     if not value or not value.strip():
         return "detached"
+    return _branch_path(value.strip())
+
+
+def _branch_path(name: str) -> str:
     # Slashes are kept: `feature/x` becomes a nested directory, which git and
     # every supported filesystem handle.
-    parts = [_sanitize(p, "-") for p in value.strip().split("/")]
+    parts = [_sanitize(p, "-") for p in name.split("/")]
     return "/".join(p for p in parts if p) or "detached"
+
+
+_RENAMED = re.compile(r"^Branch: renamed refs/heads/(.+) to refs/heads/(.+)$")
+
+
+def renamed_from(repo_root: str) -> List[str]:
+    """Every name the current branch had before a `git branch -m`, oldest first.
+
+    Read from the branch's reflog, which git carries across a rename -- so a
+    chain a -> b -> c yields both a and b from c's log. The reflog is local, so
+    a rename made in another clone is invisible here; that ledger stays split.
+    """
+    ref = _git(repo_root, ["symbolic-ref", "HEAD"])
+    if not ref or not ref.strip():
+        return []
+    text = _git(repo_root, ["reflog", "show", "--format=%gs", ref.strip(), "--"])
+    names = []
+    for line in reversed((text or "").split("\n")):
+        match = _RENAMED.match(line.strip())
+        if match and match.group(1) not in names:
+            names.append(match.group(1))
+    return names
+
+
+def entry_key(entry: dict) -> Optional[tuple]:
+    """What identifies an entry across rewrites of the line that holds it.
+
+    Excludes the priced fields, so a re-priced line is still the same entry.
+    None for an entry with no timestamp, which cannot be told apart from
+    another one and so must never be merged with it.
+    """
+    stamp = entry.get("until") or entry.get("at")
+    if not stamp:
+        return None
+    return (stamp, entry.get("since"), entry.get("parent"))
 
 
 def relative_path(repo_root: str) -> str:
@@ -167,7 +206,8 @@ def write_entry(repo_root: str, entry: dict, rel_path: Optional[str] = None) -> 
     Staging is what puts the file in *this* commit rather than the next one.
     """
     rel = rel_path or relative_path(repo_root)
-    entries = read_committed(repo_root, rel) + [entry]
+    folded, stale = _renamed_entries(repo_root, rel)
+    entries = _merge(folded, read_committed(repo_root, rel)) + [entry]
 
     path = absolute_path(repo_root, rel)
     directory = os.path.dirname(path)
@@ -178,7 +218,51 @@ def write_entry(repo_root: str, entry: dict, rel_path: Optional[str] = None) -> 
             fh.write(json.dumps(item, sort_keys=True) + "\n")
 
     _git(repo_root, ["add", "--", rel])
+    for old in stale:
+        # Only once the new file holds its entries. Staged here for the same
+        # reason the new file is: so the move lands in *this* commit.
+        _git(repo_root, ["rm", "-q", "--cached", "--ignore-unmatch", "--", old])
+        try:
+            os.remove(absolute_path(repo_root, old))
+        except OSError:
+            pass
     return rel
+
+
+def _renamed_entries(repo_root, rel):
+    # type: (str, str) -> tuple
+    """Committed entries from this branch's pre-rename ledger files.
+
+    Without this a `git branch -m old new` starts `new.jsonl` empty, and
+    everything before the rename stays in `old.jsonl` -- still in the tree, but
+    `tkus log` for `new` never reads it, so a branch's largest entry can vanish
+    from its own report. Returns (entries, paths to remove).
+
+    Only for this identity, and only when the old name is gone: a branch
+    recreated under the old name owns that file again.
+    """
+    prefix = "%s/%s/" % (LEDGER_DIR, identity(repo_root))
+    if rel != prefix + branch_name(repo_root) + ".jsonl":
+        return [], []
+    entries, stale = [], []
+    for name in renamed_from(repo_root):
+        old = prefix + _branch_path(name) + ".jsonl"
+        if old == rel or old in stale:
+            continue
+        if _git(repo_root, ["rev-parse", "--verify", "-q", "refs/heads/" + name]):
+            continue
+        found = read_committed(repo_root, old)
+        if found:
+            entries = _merge(entries, found)
+            stale.append(old)
+    return entries, stale
+
+
+def _merge(first: List[dict], then: List[dict]) -> List[dict]:
+    """`first` followed by whatever of `then` it does not already hold -- so an
+    old file someone already merged by hand is not counted twice."""
+    seen = {entry_key(e) for e in first} - {None}
+    return first + [e for e in then if entry_key(e) is None or entry_key(e) not in seen]
 
 
 def all_files(repo_root: str) -> List[str]:

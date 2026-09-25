@@ -321,8 +321,10 @@ def _commit_index(root: str, branch: str):
     linear, so no two commits can share a first parent and the index is
     unambiguous.
 
-    Returns (index, commit_count). The count comes free from this walk and is
-    what the coverage line reports against.
+    Returns (index, by_sha, commit_count). `by_sha` is the same commits keyed
+    by their own sha, for entries attributed by `_introduced_by` instead. The
+    count comes free from this walk and is what the coverage line reports
+    against.
     """
     try:
         out = subprocess.run(
@@ -330,11 +332,12 @@ def _commit_index(root: str, branch: str):
              branch],
             cwd=root, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
     except (OSError, subprocess.SubprocessError):
-        return {}, 0
+        return {}, {}, 0
     if out.returncode != 0:
-        return {}, 0            # no such branch, or no commits yet
+        return {}, {}, 0        # no such branch, or no commits yet
 
     index = {}
+    by_sha = {}
     count = 0
     for line in out.stdout.decode("utf-8", "replace").split("\n"):
         if not line.strip():
@@ -346,9 +349,50 @@ def _commit_index(root: str, branch: str):
         key = parents.split()[0] if parents.strip() else "ROOT"
         # `git log` walks newest-first, so `count` doubles as a position: a
         # higher number is older, which is what puts the table in order.
-        index[key] = (sha, subject, when, count)
+        index[key] = by_sha[sha] = (sha, subject, when, count)
         count += 1
-    return index, count
+    return index, by_sha, count
+
+
+def _introduced_by(root: str, branch: str) -> Dict[tuple, str]:
+    """Which commit on `branch` first added each ledger entry, by entry key.
+
+    This is what makes attribution survive history rewriting. The `parent`
+    pointer is fixed at write time and an amend or rebase invalidates it -- and
+    pre-commit cannot tell it is amending, so it cannot write a better one. But
+    the amended commit's diff against its real parent adds every entry it
+    carries, and a rebased commit re-adds exactly its own. It is also history,
+    not reflog, so it gives the same answer in any clone.
+
+    The oldest adding commit wins, so a line that moved between files -- a
+    folded rename, a `git mv` -- stays with the commit that first recorded it.
+    `-m` rather than `--diff-merges=first-parent`, which needs git 2.31.
+    """
+    try:
+        out = subprocess.run(
+            ["git", "-c", "core.quotepath=false", "log", "--first-parent", "-m",
+             "-p", "--no-renames", "--format=%x00%H", branch, "--",
+             repoledger.LEDGER_DIR],
+            cwd=root, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+    except (OSError, subprocess.SubprocessError):
+        return {}
+    if out.returncode != 0:
+        return {}
+
+    added = {}  # type: Dict[tuple, str]
+    sha = None
+    for line in out.stdout.decode("utf-8", "replace").split("\n"):
+        if line.startswith("\0"):
+            sha = line[1:].strip()
+        elif sha and line.startswith("+{"):
+            try:
+                entry = json.loads(line[1:])
+            except ValueError:
+                continue
+            key = repoledger.entry_key(entry) if isinstance(entry, dict) else None
+            if key:
+                added[key] = sha        # newest-first, so the oldest lands last
+    return added
 
 
 def _coverage(recorded: int, commits: int, orphans: int) -> str:
@@ -383,7 +427,8 @@ def cmd_log(args) -> int:
         if _ledger_scope(rel)[1] == branch:
             entries.extend(items)
 
-    index, commit_count = _commit_index(root, branch)
+    index, by_sha, commit_count = _commit_index(root, branch)
+    introduced = _introduced_by(root, branch) if entries else {}
 
     commits = {}
     orphaned = []
@@ -391,11 +436,16 @@ def cmd_log(args) -> int:
     for entry in entries:
         usd = float(entry.get("usd") or 0.0)
         currency = entry.get("currency", currency)
-        # "HEAD" appears in ledgers written before head_sha checked git's exit
-        # code: on an unborn branch it recorded that string instead of null.
-        # It meant the root commit then and it means the root commit now.
-        parent = entry.get("parent")
-        found = index.get("ROOT" if parent in (None, "HEAD") else parent)
+        found = by_sha.get(introduced.get(repoledger.entry_key(entry)))
+        if not found:
+            # No commit added it -- it is only in the worktree, such as the
+            # staged ledger of an abandoned commit. The parent pointer is all
+            # there is. "HEAD" appears in ledgers written before head_sha
+            # checked git's exit code: on an unborn branch it recorded that
+            # string instead of null. It meant the root commit then and it
+            # means the root commit now.
+            parent = entry.get("parent")
+            found = index.get("ROOT" if parent in (None, "HEAD") else parent)
         if not found:
             orphaned.append({"parent": entry.get("parent"),
                              "at": entry.get("until") or entry.get("at"),

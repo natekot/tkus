@@ -280,6 +280,98 @@ class TestBranchSwitching(RepoLedgerTestCase):
                         "a branch name with a slash becomes a nested path")
 
 
+class TestBranchRename(RepoLedgerTestCase):
+    """The ledger file is named after the branch, so `git branch -m` used to
+    start an empty file and leave everything before the rename in the old one --
+    where `tkus log` for the new name never looked."""
+
+    def ledger_files(self):
+        return sorted(p for p in self.git("ls-files").split("\n")
+                      if p.startswith(repoledger.LEDGER_DIR + "/"))
+
+    def test_the_next_commit_folds_the_old_file_into_the_new_one(self):
+        self.commit("base")
+        self.git("checkout", "-q", "-b", "old")
+        self.inject_usage(100000)
+        self.commit("first")
+        self.git("branch", "-m", "old", "new")
+        self.inject_usage(1000)
+        self.commit("second")
+
+        self.assertEqual(self.ledger_files(), [".tkus/Tester/new.jsonl"])
+        self.assertEqual(len(self.entries()), 2)
+        self.assertEqual(self.git("status", "--porcelain").strip(), "")
+
+    def test_rename_then_repeated_amends_loses_nothing(self):
+        """The reported case: $297 of $299 vanished from `tkus log`."""
+        self.commit("base")
+        self.git("checkout", "-q", "-b", "old")
+        self.inject_usage(100000)
+        self.commit("first")
+        self.git("branch", "-m", "old", "new")
+        self.env["GIT_EDITOR"] = "true"
+        for usage in (1000, 2000):
+            self.inject_usage(usage)
+            self.git("commit", "-q", "--amend", "--no-edit")
+
+        self.assertEqual(self.ledger_files(), [".tkus/Tester/new.jsonl"])
+        entries = self.entries()
+        self.assertEqual(len(entries), 3)
+
+        out = subprocess.run([sys.executable, "-m", "tkus", "log", "--json"],
+                             cwd=self.repo, env=self.env, stdout=subprocess.PIPE,
+                             check=True)
+        data = json.loads(out.stdout.decode())
+        self.assertEqual(data["orphaned"], [])
+        self.assertEqual([c["subject"] for c in data["commits"]], ["first"])
+        self.assertAlmostEqual(data["total"], sum(e["usd"] for e in entries),
+                               places=9)
+
+    def test_a_chain_of_renames_folds_every_step(self):
+        self.commit("base")
+        self.git("checkout", "-q", "-b", "a")
+        self.inject_usage(1000)
+        self.commit("on a")
+        self.git("branch", "-m", "a", "b")
+        self.inject_usage(2000)
+        self.commit("on b")
+        self.git("branch", "-m", "b", "c")
+        self.inject_usage(3000)
+        self.commit("on c")
+
+        self.assertEqual(self.ledger_files(), [".tkus/Tester/c.jsonl"])
+        self.assertEqual(len(self.entries()), 3)
+
+    def test_a_recreated_old_name_keeps_its_own_file(self):
+        """If `old` exists again it is a live branch, and its file is its own."""
+        self.commit("base")
+        self.git("checkout", "-q", "-b", "old")
+        self.inject_usage(1000)
+        self.commit("first")
+        self.git("branch", "-m", "old", "new")
+        self.git("branch", "old")
+        self.inject_usage(2000)
+        self.commit("second")
+
+        self.assertEqual(self.ledger_files(),
+                         [".tkus/Tester/new.jsonl", ".tkus/Tester/old.jsonl"])
+
+    def test_another_identitys_file_is_left_alone(self):
+        self.commit("base")
+        self.git("checkout", "-q", "-b", "old")
+        other = repoledger.absolute_path(self.repo, ".tkus/Someone Else/old.jsonl")
+        os.makedirs(os.path.dirname(other))
+        with open(other, "w") as fh:
+            fh.write(json.dumps({"usd": 1.0, "parent": None}) + "\n")
+        self.git("add", "-A")
+        self.git("commit", "-q", "-m", "their work")
+        self.git("branch", "-m", "old", "new")
+        self.inject_usage(1000)
+        self.commit("mine")
+
+        self.assertIn(".tkus/Someone Else/old.jsonl", self.ledger_files())
+
+
 class TestIdentityAndBranchResolution(unittest.TestCase):
     def setUp(self):
         self.repo = tempfile.mkdtemp()

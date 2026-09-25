@@ -1,14 +1,15 @@
 """`tkus log` -- per-commit cost for one branch.
 
-Exercised against real git rather than a fixture, because the command rests
-entirely on inverting the `parent` pointer that pre-commit records, and the
-operations that break that pointer -- amend, rebase -- are real git operations.
-Reasoning about them is not evidence that the total survives them.
+Exercised against real git rather than a fixture, because attribution rests on
+git history -- which commit's diff added each entry -- and the operations that
+rewrite that history -- amend, rebase, rename -- are real git operations.
+Reasoning about them is not evidence that the attribution survives them.
 """
 
 from __future__ import annotations
 
 import json
+import os
 import subprocess
 import sys
 import unittest
@@ -115,36 +116,65 @@ class TestTotalFlag(LogHarness):
         float(text.strip())          # raises if it is not a bare number
 
 
-class TestOrphanedEntries(LogHarness):
-    """Amending with new usage in the window is what actually strands an entry.
+class TestAmendKeepsAttribution(LogHarness):
+    """Amending with new usage in the window used to strand an entry.
 
-    Amending alone does not: the entry recorded the *parent*, and the amended
-    commit keeps the same parent, so it re-maps to the new sha. But pre-commit
-    runs again during the amend, and if there is fresh usage it writes a second
-    entry whose parent is the pre-amend commit -- which the amend then makes
-    unreachable, permanently.
+    Pre-commit runs again during the amend and, if there is fresh usage, writes
+    a second entry whose `parent` is the pre-amend commit -- which the amend then
+    makes unreachable. Pre-commit cannot know it is amending, so the pointer
+    cannot be fixed at write time. `log` instead credits each entry to the commit
+    whose diff added it, and the amended commit's diff adds every entry.
     """
 
-    def orphan_one(self):
-        self.inject_usage(4000)
-        self.commit("original")
-        self.inject_usage(2000)
+    def amend(self, usage):
+        self.inject_usage(usage)
         self.env["GIT_EDITOR"] = "true"
         self.git("commit", "-q", "--amend", "-m", "reworded")
 
-    def test_the_money_survives_even_though_the_commit_pointer_does_not(self):
-        self.orphan_one()
-        data = self.as_json()
+    def test_amending_after_new_usage_keeps_it_on_the_amended_commit(self):
+        self.inject_usage(4000)
+        self.commit("original")
+        self.amend(2000)
 
-        self.assertEqual(len(data["orphaned"]), 1)
+        data = self.as_json()
+        self.assertEqual(data["orphaned"], [])
         self.assertEqual([c["subject"] for c in data["commits"]], ["reworded"])
         self.assertAlmostEqual(
-            data["total"], sum(e["usd"] for e in self.entries()), places=9,
-            msg="an orphaned entry is still real money and must be in TOTAL")
-        self.assertIn("orphaned", self.stdout())
+            data["commits"][0]["usd"], sum(e["usd"] for e in self.entries()),
+            places=9)
 
-    def test_orphans_still_agree_with_rollup(self):
-        self.orphan_one()
+    def test_repeated_amends_keep_everything_on_one_commit(self):
+        """The reported case: every amend used to strand the one before it."""
+        self.commit("base")
+        self.inject_usage(100000)
+        self.commit("first")
+        self.amend(1000)
+        self.amend(2000)
+
+        self.assertEqual(len(self.entries()), 3)
+        data = self.as_json()
+        self.assertEqual(data["orphaned"], [])
+        self.assertEqual([c["subject"] for c in data["commits"]], ["reworded"])
+        self.assertAlmostEqual(data["commits"][0]["usd"], data["total"], places=9)
+
+    def test_attribution_survives_into_a_fresh_clone(self):
+        """No reflog, no .git/tkus state: history alone has to be enough."""
+        self.inject_usage(4000)
+        self.commit("original")
+        self.amend(2000)
+
+        clone = os.path.join(self.tmp, "clone")
+        self.git("clone", "-q", self.repo, clone)
+        out = self.log("--json", cwd=clone)
+        self.assertEqual(out.returncode, 0, out.stderr.decode())
+        data = json.loads(out.stdout.decode())
+        self.assertEqual(data["orphaned"], [])
+        self.assertEqual([c["subject"] for c in data["commits"]], ["reworded"])
+
+    def test_totals_still_agree_with_rollup(self):
+        self.inject_usage(4000)
+        self.commit("original")
+        self.amend(2000)
         rollup = subprocess.run(
             [sys.executable, "-m", "tkus", "rollup"], cwd=self.repo,
             env=self.env, stdout=subprocess.PIPE).stdout.decode()
@@ -153,7 +183,7 @@ class TestOrphanedEntries(LogHarness):
                                float(row.split()[-1]), places=2)
 
     def test_amending_without_new_usage_keeps_the_entry_attributed(self):
-        """The mirror image: no new usage, no second entry, nothing stranded."""
+        """No new usage, no second entry, nothing stranded."""
         self.inject_usage(4000)
         self.commit("original")
         self.env["GIT_EDITOR"] = "true"
@@ -162,6 +192,58 @@ class TestOrphanedEntries(LogHarness):
         data = self.as_json()
         self.assertEqual(data["orphaned"], [])
         self.assertEqual([c["subject"] for c in data["commits"]], ["reworded"])
+
+
+class TestRebaseKeepsAttribution(LogHarness):
+    def test_each_rebased_commit_keeps_its_own_cost(self):
+        """A rebase gives every commit a new parent, so the recorded pointers
+        all name commits that are no longer on the branch."""
+        self.commit("base")
+        self.git("checkout", "-q", "-b", "feature")
+        self.inject_usage(1000)
+        self.commit("a", content="a\n")
+        self.inject_usage(9000)
+        self.commit("b", content="b\n")
+        before = {c["subject"]: c["usd"] for c in self.as_json()["commits"]}
+
+        self.git("checkout", "-q", "main")
+        with open(os.path.join(self.repo, "g.txt"), "w") as fh:
+            fh.write("moved\n")
+        self.git("add", "g.txt")
+        self.git("commit", "-q", "-m", "main moves on")
+        self.git("checkout", "-q", "feature")
+        self.git("rebase", "-q", "main")
+
+        data = self.as_json()
+        self.assertEqual(data["orphaned"], [])
+        after = {c["subject"]: c["usd"] for c in data["commits"]}
+        self.assertEqual(set(after), {"a", "b"})
+        for subject in ("a", "b"):
+            self.assertAlmostEqual(after[subject], before[subject], places=9)
+
+
+class TestOrphanedEntries(LogHarness):
+    """What is still orphaned: an entry in the worktree that no commit added,
+    such as the staged ledger an abandoned commit leaves behind."""
+
+    def strand_one(self):
+        self.inject_usage(4000)
+        self.commit("recorded")
+        path = repoledger.absolute_path(self.repo)
+        with open(path, "a", newline="\n") as fh:
+            fh.write(json.dumps({"usd": 0.5, "currency": "USD",
+                                 "parent": self.git("rev-parse", "HEAD").strip(),
+                                 "until": "2099-01-01T00:00:00.000Z"}) + "\n")
+
+    def test_the_money_survives_even_though_no_commit_claims_it(self):
+        self.strand_one()
+        data = self.as_json()
+        self.assertEqual(len(data["orphaned"]), 1)
+        self.assertEqual([c["subject"] for c in data["commits"]], ["recorded"])
+        self.assertAlmostEqual(
+            data["total"], sum(c["usd"] for c in data["commits"]) + 0.5, places=9,
+            msg="an orphaned entry is still real money and must be in TOTAL")
+        self.assertIn("orphaned", self.stdout())
 
 
 class TestCoverageLine(LogHarness):
@@ -186,9 +268,9 @@ class TestCoverageLine(LogHarness):
         self.commit("recorded")
         self.assertNotIn("orphaned", self.stdout())
 
-        self.inject_usage(500)
-        self.env["GIT_EDITOR"] = "true"
-        self.git("commit", "-q", "--amend", "-m", "reworded")
+        with open(repoledger.absolute_path(self.repo), "a", newline="\n") as fh:
+            fh.write(json.dumps({"usd": 0.5, "currency": "USD", "parent": "f" * 40,
+                                 "until": "2099-01-01T00:00:00.000Z"}) + "\n")
         self.assertIn("1 entry orphaned", self.stdout())
 
 
@@ -224,7 +306,6 @@ class TestBranchScope(LogHarness):
 
         # A second person's ledger file for the same branch.
         other = repoledger.absolute_path(self.repo, ".tkus/Someone Else/main.jsonl")
-        import os
         os.makedirs(os.path.dirname(other), exist_ok=True)
         with open(other, "w") as fh:
             fh.write(json.dumps({"usd": 1.25, "currency": "USD",

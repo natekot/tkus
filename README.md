@@ -281,6 +281,10 @@ counted exactly once.
 keeps its entry — the entry is already in the index — and adds only new usage. A
 squash merges entries like any file.
 
+**Renaming a branch** carries its ledger along: the first commit after `git
+branch -m old new` moves the entries in `old.jsonl` into `new.jsonl` and removes
+the old file.
+
 **Abandoning a commit** in the editor leaves nothing behind: the next commit
 rebuilds the ledger from `HEAD`.
 
@@ -335,23 +339,26 @@ The scope is the branch's **own** entries — the same figure as its row in `tku
 rollup`. Work that arrived through a merge stays attributed to the branch it was
 written on, so summing every branch double-counts nothing.
 
-#### The total is exact; the per-commit attribution is best-effort
+#### How entries find their commits
 
 An entry is written in `pre-commit`, when the new commit's SHA does not yet
-exist, so it records the **parent** instead. Getting back to the commit means
-inverting that — and history rewriting breaks the pointer: a rebase gives the
-commit a different parent, and amending after further agent work strands the
-entry written during the amend on a commit that no longer exists.
+exist. So `tkus log` credits each entry to the **commit whose diff added it**,
+read from the history of the ledger files. That survives history rewriting: an
+amended commit's diff adds every entry it carries, including the one written
+during the amend, and each rebased commit re-adds exactly its own. It is plain
+history, so every clone gives the same answer.
 
-Those entries are still real money, so they are counted in `TOTAL` and shown on
-their own line rather than dropped. **`TOTAL` therefore always agrees with the
-branch's `rollup` row**, whatever git has done to the history.
+An entry no commit added — one only in the worktree, such as the staged ledger
+of an abandoned commit — falls back to the **parent** SHA it recorded, and is
+shown as orphaned if that no longer identifies a commit. Orphans are still real
+money, so they are counted in `TOTAL` and shown on their own line rather than
+dropped. **`TOTAL` therefore always agrees with the branch's `rollup` row**,
+whatever git has done to the history.
 
 The coverage line is how you judge the breakdown: it reports how many of the
 branch's commits carry usage at all — commits made before `tkus install`, or
 with no agent usage, are simply absent from the table — and how many entries
-have been orphaned. In a repository that rebases often, expect the orphaned
-share to grow.
+are orphaned.
 
 ### Seeing the rates
 
@@ -613,18 +620,17 @@ per-developer spend visible to everyone with repository access.
   out of review diffs.
 - **No cost in `git log`.** Reading it requires `tkus`. That is the price of
   leaving commit messages alone.
-- **Per-commit mapping is best-effort.** Entries record the parent SHA, which
-  identifies a commit on linear history but not after a squash — where per-commit
-  attribution genuinely no longer exists, since the commits do not.
+- **Per-commit mapping ends at a squash.** After a squash the individual
+  commits no longer exist, so their entries are all credited to the squash
+  commit.
 - **Long gaps.** A commit made after days of uncommitted work absorbs all of it.
 - **Interleaved branches** share one repository-level cursor, so usage lands on
   whichever branch commits first.
-- **Branch renames split a branch's ledger.** The ledger file is named after
-  the branch, so after `git branch -m old new` the next commit starts
-  `new.jsonl` and `old.jsonl` stays behind. Nothing is lost or double-counted,
-  but `tkus rollup` shows two rows, and `tkus log --branch old` reports the
-  pre-rename entries as orphaned because the `old` ref no longer exists.
-  To merge them by hand, move the old file's lines into the new one and commit.
+- **Branch renames are found through the local reflog.** The next commit
+  after `git branch -m old new` folds `old.jsonl` into `new.jsonl`, unless a
+  branch named `old` exists again. A rename made in another clone isn't in this
+  clone's reflog, so its ledger stays split: `tkus rollup` shows two rows until
+  you move the old file's lines into the new one and commit.
 - **Windows code paths are tested but have not been run on Windows.**
 
 ### Other agents
