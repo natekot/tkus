@@ -48,6 +48,10 @@
       "standard": [{"from": null, "until": null, "input": 10.0, "output": 50.0,
                     "cache": {"cache_read": 0.25}}]
     },
+    "claude-opus-5-5": {
+      "standard": [{"from": null, "until": null, "input": 4.0, "output": 20.0,
+                    "cache": {"cache_read": 0.2}}]
+    },
     "claude-opus-5": {
       "standard": [{"from": null, "until": null, "input": 5.0, "output": 25.0}],
       "fast": [{"from": null, "until": null, "input": 10.0, "output": 50.0}]

@@ -264,10 +264,10 @@ if __name__ == "__main__":
 class TestExplicitCachePrices(unittest.TestCase):
     """A window may state a cache price outright instead of deriving it.
 
-    The multipliers hold for every model but two: Fable 5.1 and Mythos 5.1
-    price cache reads at 0.025x input where everything else is 0.1x. Deriving
-    those would overstate cached reads fourfold, on the token category that
-    dominates real agent usage.
+    The multipliers hold for every model but three: Fable 5.1 and Mythos 5.1
+    price cache reads at 0.025x input, and Opus 5.5 at 0.05x, where everything
+    else is 0.1x. Deriving those would overstate cached reads two- to fourfold,
+    on the token category that dominates real agent usage.
     """
 
     def setUp(self):
@@ -342,3 +342,35 @@ class TestBundledFiveOneModels(unittest.TestCase):
             [record(model="claude-fable-5-1", input_tokens=MTOK,
                     output_tokens=MTOK)], self.table)
         self.assertAlmostEqual(cost.total, 60.0, places=6)
+
+
+class TestBundledOpus55(unittest.TestCase):
+    """Opus 5.5 ships on tier_4_20_cache_read_0_20: $4/$20, cache reads at
+    $0.20/MTok -- 0.05x input, so deriving them would double the figure."""
+
+    def setUp(self):
+        self.table = RateTable.load(None)
+
+    def test_opus_5_5_is_priced(self):
+        """Absent from the table, every token it spent was reported unpriced."""
+        cost = compute_cost(
+            [record(model="claude-opus-5-5", input_tokens=MTOK,
+                    output_tokens=MTOK)], self.table)
+        self.assertEqual(cost.unpriced_models, [])
+        self.assertAlmostEqual(cost.total, 24.0, places=6)
+
+    def test_cache_reads_are_the_stated_price_not_the_derived_one(self):
+        cost = compute_cost(
+            [record(model="claude-opus-5-5", cache_read=MTOK)], self.table)
+        self.assertAlmostEqual(cost.total, 0.2, places=6)
+
+    def test_cache_writes_still_follow_the_multipliers(self):
+        self.assertEqual(
+            self.table.cache_rates("claude-opus-5-5", "standard", at("2026-09-25")),
+            (8.0, 5.0, 0.2))
+
+    def test_opus_5_is_unchanged(self):
+        """The point release is a different model, not an alias of the old one."""
+        cost = compute_cost(
+            [record(model="claude-opus-5", input_tokens=MTOK)], self.table)
+        self.assertAlmostEqual(cost.total, 5.0, places=6)
