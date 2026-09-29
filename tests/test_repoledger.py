@@ -99,6 +99,10 @@ class RepoLedgerTestCase(unittest.TestCase):
                 out.extend(json.loads(l) for l in blob.split("\n") if l.strip())
         return out
 
+    def ledger_files(self):
+        return sorted(p for p in self.git("ls-files").split("\n")
+                      if p.startswith(repoledger.LEDGER_DIR + "/"))
+
 
 class TestCommitMessagesAreUntouched(RepoLedgerTestCase):
     def test_message_is_byte_identical_to_one_without_tkus(self):
@@ -285,10 +289,6 @@ class TestBranchRename(RepoLedgerTestCase):
     start an empty file and leave everything before the rename in the old one --
     where `tkus log` for the new name never looked."""
 
-    def ledger_files(self):
-        return sorted(p for p in self.git("ls-files").split("\n")
-                      if p.startswith(repoledger.LEDGER_DIR + "/"))
-
     def test_the_next_commit_folds_the_old_file_into_the_new_one(self):
         self.commit("base")
         self.git("checkout", "-q", "-b", "old")
@@ -370,6 +370,162 @@ class TestBranchRename(RepoLedgerTestCase):
         self.commit("mine")
 
         self.assertIn(".tkus/Someone Else/old.jsonl", self.ledger_files())
+
+    def test_a_commit_with_no_usage_still_folds(self):
+        """Otherwise the split outlives every commit until one happens to use
+        an agent, and `tkus log` is wrong for all of them."""
+        self.commit("base")
+        self.git("checkout", "-q", "-b", "old")
+        self.inject_usage(1000)
+        self.commit("first")
+        self.git("branch", "-m", "old", "new")
+        self.commit("no agent here")
+
+        self.assertEqual(self.ledger_files(), [".tkus/Tester/new.jsonl"])
+        self.assertEqual(len(self.entries()), 1)
+
+
+class TestRenameCommand(RepoLedgerTestCase):
+    """`tkus rename` covers the name changes the reflog cannot see: a new branch
+    cut from the old one before deleting it, or a rename made on GitHub or in
+    another clone. Without it the old entries stay in a file `tkus log` for the
+    new name never reads."""
+
+    def tkus(self, *args):
+        return subprocess.run([sys.executable, "-m", "tkus"] + list(args),
+                              cwd=self.repo, env=self.env, stdout=subprocess.PIPE,
+                              stderr=subprocess.PIPE)
+
+    def recut(self):
+        """Work on `old`, then carry on as `new` the way the reflog can't see."""
+        self.commit("base")
+        self.git("checkout", "-q", "-b", "old")
+        self.inject_usage(100000)
+        self.commit("first")
+        self.git("checkout", "-q", "-b", "new")
+        self.git("branch", "-D", "old")
+
+    def aliases(self, branch="new"):
+        return self.git("config", "--get-all", "branch.%s.tkusRenamedFrom" % branch,
+                        check=False).split()
+
+    def test_the_next_commit_folds_the_named_file(self):
+        self.recut()
+        self.assertEqual(self.tkus("rename", "old").returncode, 0)
+        self.inject_usage(1000)
+        self.commit("second")
+
+        self.assertEqual(self.ledger_files(), [".tkus/Tester/new.jsonl"])
+        self.assertEqual(len(self.entries()), 2)
+        self.assertEqual(self.git("status", "--porcelain").strip(), "")
+
+    def test_without_the_command_the_ledger_stays_split(self):
+        """The case being fixed, so the test above means something."""
+        self.recut()
+        self.inject_usage(1000)
+        self.commit("second")
+
+        self.assertEqual(self.ledger_files(),
+                         [".tkus/Tester/new.jsonl", ".tkus/Tester/old.jsonl"])
+
+    def test_a_commit_with_no_usage_folds(self):
+        self.recut()
+        self.tkus("rename", "old")
+        self.commit("no agent here")
+
+        self.assertEqual(self.ledger_files(), [".tkus/Tester/new.jsonl"])
+        self.assertEqual(len(self.entries()), 1)
+
+    def test_an_abandoned_commit_neither_loses_nor_doubles(self):
+        """The fold is staged in pre-commit, so an abandoned commit leaves it in
+        the index. The next commit must redo it from HEAD, not trust that."""
+        self.recut()
+        self.tkus("rename", "old")
+        self.inject_usage(1000)
+        with open(os.path.join(self.repo, "f.txt"), "a") as fh:
+            fh.write("x")
+        self.git("add", "f.txt")
+        self.env["GIT_EDITOR"] = "false"
+        self.git("commit", check=False)
+        self.env["GIT_EDITOR"] = "true"
+        self.git("commit", "-q", "-m", "for real this time")
+
+        self.assertEqual(self.ledger_files(), [".tkus/Tester/new.jsonl"])
+        self.assertEqual(len(self.entries()), 2)
+
+    def test_log_credits_folded_entries_to_the_commits_that_spent_them(self):
+        self.recut()
+        self.tkus("rename", "old")
+        self.inject_usage(1000)
+        self.commit("second")
+
+        data = json.loads(self.tkus("log", "--json").stdout.decode())
+        self.assertEqual(data["orphaned"], [])
+        self.assertEqual(sorted(c["subject"] for c in data["commits"]),
+                         ["first", "second"])
+        self.assertAlmostEqual(data["total"], sum(e["usd"] for e in self.entries()),
+                               places=9)
+
+    def test_the_alias_follows_a_later_branch_m(self):
+        """Branch config moves with `git branch -m`, so a pending rename does
+        not strand itself on the name it was made under."""
+        self.recut()
+        self.tkus("rename", "old")
+        self.git("branch", "-m", "new", "newer")
+        self.commit("second")
+
+        self.assertEqual(self.ledger_files(), [".tkus/Tester/newer.jsonl"])
+
+    def test_refuses_while_the_old_branch_still_exists(self):
+        """The fold leaves a live branch's file alone, so accepting this would
+        record a rename that silently never happens."""
+        self.commit("base")
+        self.git("checkout", "-q", "-b", "old")
+        self.inject_usage(1000)
+        self.commit("first")
+        self.git("checkout", "-q", "-b", "new")
+
+        out = self.tkus("rename", "old")
+        self.assertEqual(out.returncode, 1)
+        self.assertIn("git branch -D old", out.stderr.decode())
+        self.assertEqual(self.aliases(), [])
+
+    def test_refuses_a_name_with_no_ledger(self):
+        self.recut()
+        self.assertEqual(self.tkus("rename", "nonesuch").returncode, 1)
+        self.assertEqual(self.aliases(), [])
+
+    def test_refuses_to_rename_a_branch_into_itself(self):
+        self.recut()
+        self.assertEqual(self.tkus("rename", "new", "new").returncode, 1)
+        self.assertEqual(self.aliases(), [])
+
+    def test_running_it_twice_records_it_once(self):
+        self.recut()
+        self.tkus("rename", "old")
+        self.tkus("rename", "old")
+        self.assertEqual(self.aliases(), ["old"])
+
+    def test_an_explicit_target_need_not_be_checked_out(self):
+        self.recut()
+        self.git("checkout", "-q", "-b", "elsewhere")
+        self.assertEqual(self.tkus("rename", "old", "new").returncode, 0)
+        self.assertEqual(self.aliases("new"), ["old"])
+        self.assertEqual(self.aliases("elsewhere"), [])
+
+    def test_with_no_arguments_it_lists_ledgers_of_deleted_branches(self):
+        self.recut()
+        self.git("checkout", "-q", "-b", "live")
+        self.inject_usage(1000)
+        self.commit("on live")
+        self.git("checkout", "-q", "new")
+        self.git("merge", "-q", "--no-edit", "live")
+
+        out = self.tkus("rename")
+        self.assertEqual(out.returncode, 0)
+        listing = out.stdout.decode()
+        self.assertIn("old", listing)
+        self.assertNotIn("live", listing)
 
 
 class TestIdentityAndBranchResolution(unittest.TestCase):

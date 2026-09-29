@@ -88,12 +88,17 @@ def _branch_path(name: str) -> str:
 _RENAMED = re.compile(r"^Branch: renamed refs/heads/(.+) to refs/heads/(.+)$")
 
 
+ALIAS_KEY = "tkusRenamedFrom"
+
+
 def renamed_from(repo_root: str) -> List[str]:
-    """Every name the current branch had before a `git branch -m`, oldest first.
+    """Every name the current branch had before a `git branch -m`, oldest first,
+    then any recorded with `tkus rename`.
 
     Read from the branch's reflog, which git carries across a rename -- so a
     chain a -> b -> c yields both a and b from c's log. The reflog is local, so
-    a rename made in another clone is invisible here; that ledger stays split.
+    a rename made in another clone is invisible here, as is a branch cut from
+    the old one before deleting it; `tkus rename` records those by hand.
     """
     ref = _git(repo_root, ["symbolic-ref", "HEAD"])
     if not ref or not ref.strip():
@@ -104,7 +109,29 @@ def renamed_from(repo_root: str) -> List[str]:
         match = _RENAMED.match(line.strip())
         if match and match.group(1) not in names:
             names.append(match.group(1))
-    return names
+    short = ref.strip()[len("refs/heads/"):]
+    return names + [n for n in aliases(repo_root, short) if n not in names]
+
+
+def aliases(repo_root: str, branch: str) -> List[str]:
+    """Names recorded by `tkus rename` as this branch's former ones.
+
+    Kept in the branch's own config section because git maintains it for us:
+    `git branch -m` carries it to the new name and `git branch -D` deletes it,
+    so an alias can neither strand itself nor outlive its branch.
+    """
+    text = _git(repo_root, ["config", "--get-all",
+                            "branch.%s.%s" % (branch, ALIAS_KEY)])
+    return [line.strip() for line in (text or "").split("\n") if line.strip()]
+
+
+def add_alias(repo_root: str, branch: str, old: str) -> None:
+    if old not in aliases(repo_root, branch):
+        _git(repo_root, ["config", "--add", "branch.%s.%s" % (branch, ALIAS_KEY), old])
+
+
+def branch_exists(repo_root: str, name: str) -> bool:
+    return bool(_git(repo_root, ["rev-parse", "--verify", "-q", "refs/heads/" + name]))
 
 
 def entry_key(entry: dict) -> Optional[tuple]:
@@ -200,14 +227,18 @@ def read_worktree(repo_root: str, rel_path: Optional[str] = None) -> List[dict]:
         return []
 
 
-def write_entry(repo_root: str, entry: dict, rel_path: Optional[str] = None) -> str:
+def write_entry(repo_root, entry, rel_path=None):
+    # type: (str, Optional[dict], Optional[str]) -> str
     """Rebuild the ledger from HEAD plus this entry, and stage it.
 
     Staging is what puts the file in *this* commit rather than the next one.
+    With no entry it only folds in a renamed branch's file (see pending_fold).
     """
     rel = rel_path or relative_path(repo_root)
     folded, stale = _renamed_entries(repo_root, rel)
-    entries = _merge(folded, read_committed(repo_root, rel)) + [entry]
+    entries = _merge(folded, read_committed(repo_root, rel))
+    if entry is not None:
+        entries.append(entry)
 
     path = absolute_path(repo_root, rel)
     directory = os.path.dirname(path)
@@ -249,13 +280,28 @@ def _renamed_entries(repo_root, rel):
         old = prefix + _branch_path(name) + ".jsonl"
         if old == rel or old in stale:
             continue
-        if _git(repo_root, ["rev-parse", "--verify", "-q", "refs/heads/" + name]):
+        if branch_exists(repo_root, name):
             continue
         found = read_committed(repo_root, old)
         if found:
             entries = _merge(entries, found)
             stale.append(old)
     return entries, stale
+
+
+def pending_fold(repo_root: str, rel: str) -> bool:
+    """Whether a renamed branch's file is waiting to be folded into `rel`.
+
+    Checked on commits with no agent usage, which otherwise write nothing -- so
+    without it the split would last until some commit happened to use an
+    agent, and `tkus log` would be wrong for every commit before that one.
+    """
+    return bool(_renamed_entries(repo_root, rel)[1])
+
+
+def branch_file(repo_root: str, branch: str) -> str:
+    """This identity's ledger path for a branch other than the current one."""
+    return "%s/%s/%s.jsonl" % (LEDGER_DIR, identity(repo_root), _branch_path(branch))
 
 
 def _merge(first: List[dict], then: List[dict]) -> List[dict]:

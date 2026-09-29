@@ -275,7 +275,8 @@ first, or absorb it with `git commit --allow-empty -m "start tkus"`.
 **Every commit after** claims only usage since the previous one. Every token is
 counted exactly once.
 
-**Commits with no AI usage** add no ledger entry and change nothing.
+**Commits with no AI usage** add no ledger entry and change nothing, except to
+finish a pending branch rename.
 
 **Amend, squash, rebase** all work without special handling. An amended commit
 keeps its entry — the entry is already in the index — and adds only new usage. A
@@ -284,6 +285,19 @@ squash merges entries like any file.
 **Renaming a branch** carries its ledger along: the first commit after `git
 branch -m old new` moves the entries in `old.jsonl` into `new.jsonl` and removes
 the old file.
+
+That relies on the reflog, which misses a branch cut from the old one before
+deleting it, or one renamed on GitHub or in another clone. For those, say so:
+
+```sh
+tkus rename            # list ledgers whose branch no longer exists
+tkus rename old        # fold old.jsonl into the current branch's at the next commit
+tkus rename old new    # ...or into new's, the next time you commit on it
+```
+
+It refuses while a branch named `old` still exists, since that file is still
+that branch's. The move lands in your next commit, even one with no AI usage;
+until then `tkus log` and `rollup` still show the split.
 
 **Abandoning a commit** in the editor leaves nothing behind: the next commit
 rebuilds the ledger from `HEAD`.
@@ -305,6 +319,7 @@ transcript store.
 | `tkus report [--all]` | Usage not yet attributed to a commit |
 | `tkus rollup [--by branch\|identity\|date]` | Totals from the tracked ledger |
 | `tkus log [--branch N] [--total]` | Per-commit cost for one branch |
+| `tkus rename [<old> [<new>]]` | Carry a branch's ledger over after its name changed |
 | `tkus reprice` | Re-price the ledger with the current rate table |
 | `tkus show [<commit>]` | Per-commit detail from the local `.git/` ledger |
 | `tkus rates [--at DATE] [--json]` | The rate table used for pricing |
@@ -629,9 +644,10 @@ per-developer spend visible to everyone with repository access.
   whichever branch commits first.
 - **Branch renames are found through the local reflog.** The next commit
   after `git branch -m old new` folds `old.jsonl` into `new.jsonl`, unless a
-  branch named `old` exists again. A rename made in another clone isn't in this
-  clone's reflog, so its ledger stays split: `tkus rollup` shows two rows until
-  you move the old file's lines into the new one and commit.
+  branch named `old` exists again. A rename the reflog can't see — made in
+  another clone, or by cutting a new branch and deleting the old one — stays
+  split, and `tkus rollup` shows two rows, until you run `tkus rename old` and
+  commit.
 - **Windows code paths are tested but have not been run on Windows.**
 
 ### Other agents
@@ -662,7 +678,7 @@ Ledger entries already committed are ordinary files and stay in history.
 ```sh
 git clone https://github.com/natekot/tkus.git
 cd tkus
-python3 -m unittest discover -s tests -t .      # 156 tests
+python3 -m unittest discover -s tests -t .      # 286 tests
 ```
 
 The suite includes regressions pinned to redacted snapshots of real agent data

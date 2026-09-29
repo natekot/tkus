@@ -100,6 +100,12 @@ def hook_pre_commit(root: str, argv: List[str]) -> int:
     records = collect_all(root, since, window_end)
     totals = aggregate_by_model(records)
     if not totals:
+        if repoledger.enabled(table):
+            rel = repoledger.relative_path(root)
+            if repoledger.pending_fold(root, rel) and (
+                    repoledger.is_tracked(root, rel)
+                    or not repoledger.is_ignored(root, rel)):
+                repoledger.write_entry(root, None, rel)
         cursor_mod.write_pending(root, window_end)
         return 0
 
@@ -511,6 +517,76 @@ def cmd_log(args) -> int:
               % ("--", orphan_total))
     print("-" * rule)
     print("%-9s %10.2f  %s" % ("TOTAL", total, currency))
+    return 0
+
+
+def _usd(entries: List[dict]) -> float:
+    return sum(float(e.get("usd") or 0.0) for e in entries)
+
+
+def cmd_rename(args) -> int:
+    """Carry a branch's ledger over to the name it continued under.
+
+    `git branch -m` is folded automatically, but only because the reflog says
+    so. A branch cut from the old one before deleting it, or renamed on GitHub
+    or in another clone, leaves nothing to find -- so this records the old name
+    and the next commit folds it the same way.
+
+    It records rather than moves because pre-commit rebuilds the ledger from
+    HEAD: a moved-and-staged file would be overwritten by the next commit,
+    while the staged removal of the old one still landed.
+    """
+    root = repo_root()
+    if not args.old:
+        return _list_rename_candidates(root)
+
+    new = args.new or repoledger.branch_name(root)
+    old_rel = repoledger.branch_file(root, args.old)
+    new_rel = repoledger.branch_file(root, new)
+    if old_rel == new_rel:
+        sys.stderr.write("tkus: %s and %s share one ledger file\n" % (args.old, new))
+        return 1
+    found = repoledger.read_committed(root, old_rel)
+    if not found:
+        sys.stderr.write("tkus: no committed ledger at %s -- run `tkus rename` "
+                         "with no arguments to list candidates\n" % old_rel)
+        return 1
+    if repoledger.branch_exists(root, args.old):
+        # The fold leaves a live branch's file alone, so recording this would
+        # promise a move that never happens.
+        sys.stderr.write("tkus: branch %s still exists, so its ledger is still "
+                         "its own; delete it first (git branch -D %s)\n"
+                         % (args.old, args.old))
+        return 1
+
+    repoledger.add_alias(root, new, args.old)
+    print("%d entr%s (%s %s) from %s will move into %s at your next commit"
+          % (len(found), "y" if len(found) == 1 else "ies", _money(_usd(found)),
+             found[0].get("currency", "USD"), old_rel, new_rel))
+    return 0
+
+
+def _list_rename_candidates(root: str) -> int:
+    """This identity's ledgers whose branch no longer exists here."""
+    mine = repoledger.identity(root)
+    current = repoledger.branch_name(root)
+    rows = []
+    for rel in repoledger.all_files(root):
+        who, branch = _ledger_scope(rel)
+        if who != mine or branch == current or repoledger.branch_exists(root, branch):
+            continue
+        entries = repoledger.read_committed(root, rel)
+        if entries:
+            rows.append((branch, len(entries), _usd(entries)))
+    if not rows:
+        print("no ledgers here belong to a deleted branch")
+        return 0
+    width = max(len(r[0]) for r in rows)
+    print("ledgers whose branch no longer exists (tkus rename <old>):")
+    for branch, count, usd in sorted(rows):
+        print("  %-*s %4d entr%s %10s" % (width, branch, count,
+                                          "y  " if count == 1 else "ies",
+                                          _money(usd)))
     return 0
 
 
@@ -1067,6 +1143,14 @@ def build_parser() -> argparse.ArgumentParser:
     log.add_argument("--json", action="store_true",
                      help="machine-readable output")
     log.set_defaults(func=cmd_log)
+
+    rename = sub.add_parser(
+        "rename", help="carry a branch's ledger over after its name changed")
+    rename.add_argument("old", nargs="?",
+                        help="the former branch name (omit to list candidates)")
+    rename.add_argument("new", nargs="?",
+                        help="the branch it continued as (default: the current one)")
+    rename.set_defaults(func=cmd_rename)
 
     reprice = sub.add_parser("reprice",
                              help="re-price the ledger with the current rates")
