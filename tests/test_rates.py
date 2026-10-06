@@ -174,8 +174,9 @@ class TestRatesCommand(unittest.TestCase):
             json.dump({"models": {"claude-opus-5": {"standard": [
                 {"from": None, "until": None, "input": 3.5, "output": 17.5}]}}}, fh)
         _, text = self.run_rates(cwd=repo)
+        # Match the model column exactly: `claude-opus-5-5` shares the prefix.
         line = [l for l in text.split("\n")
-                if l.startswith("claude-opus-5") and "standard" in l][0]
+                if l.split()[:2] == ["claude-opus-5", "standard"]][0]
         self.assertIn("4.3750", line)      # 1.25 x 3.50, not 4.38
         self.assertNotIn("4.38 ", line)
 
