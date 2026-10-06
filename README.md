@@ -31,6 +31,7 @@ commit time from data that is already there.
 - [Installation](#installation)
 - [Why a ledger](#why-a-ledger)
 - [What gets committed](#what-gets-committed)
+- [Ledger format](#ledger-format)
 - [Windows](#windows)
 - [Deploying across many repositories](#deploying-across-many-repositories)
 - [What to expect](#what-to-expect)
@@ -207,6 +208,60 @@ Add this to `.gitattributes` to keep it out of review diffs:
 
 ---
 
+## Ledger format
+
+The `.tkus/` files are a stable interface. Tools that report on AI spend can
+read them directly, from any clone or through a hosting API, without installing
+`tkus`.
+
+**Path.** `.tkus/<identity>/<branch>.jsonl`. `<identity>` is `tkus.identity`,
+falling back to `user.name`, with slashes replaced by `-`. `<branch>` keeps its
+slashes as nested directories, so `feature/x` is `.tkus/<identity>/feature/x.jsonl`.
+A detached HEAD files under `detached`. In both names, characters that Windows
+forbids in filenames (`<>:"\|?*` and control characters) become `-`, so a path
+matches the branch name exactly unless it contained one of those. A renamed
+branch's entries move to its new file at the next commit; until then, or when
+tkus cannot see the rename, they stay under the old name (see [Known
+limitations](#known-limitations)).
+
+**Entries.** One JSON object per line, one line per commit that had usage:
+
+```json
+{"at": "2026-09-08T19:04:26.645Z", "since": "2026-09-08T18:55:12.388Z",
+ "until": "2026-09-08T19:04:26.645Z", "parent": "5dc98a31357c5e2300982b64c17948bcd3d90e7a",
+ "currency": "USD", "usd": 4.721591, "rates_version": "2026-08",
+ "providers": [{"provider": "claude-code", "model": "claude-opus-5", "reqs": 48,
+                "in": 96, "out": 24875, "cr": 7279392, "cw1h": 45954, "usd": 4.721591}]}
+```
+
+| Field | Meaning |
+|---|---|
+| `at` | When the entry was written (UTC, ISO 8601) |
+| `since`, `until` | The usage window claimed; `since` is `null` on the first entry after install, which claims everything before it |
+| `parent` | SHA of `HEAD` when the commit was made, `null` for the root commit. A fallback only: the commit whose diff added the entry is authoritative — see [How entries find their commits](#how-entries-find-their-commits) |
+| `currency`, `usd` | Total cost of the entry |
+| `rates_version` | Version of the rate table that priced it |
+| `providers[]` | One row per provider and model: `provider`, `model`, `usd`, and token counters |
+
+The counters are `reqs` (requests), `in` (uncached input), `out`, `cr` (cache
+reads), `cw1h` and `cw5m` (cache writes by TTL), `ws` (web searches), `reas`
+(reasoning tokens) and `naiu` (Copilot nano AI Units). A counter that is zero is
+omitted.
+
+**Stability.** Fields may be added; none will be renamed or removed, or change
+meaning. Readers should ignore fields they do not recognise, and treat a missing
+counter as zero. A committed entry's content is never rewritten — a branch
+rename moves it to another file unchanged — so `usd` is the price when it was
+recorded, and `tkus reprice` only reports what the same tokens would cost
+today.
+
+**Joining to pull requests.** Squash+merge keeps a branch's ledger file in the
+default branch's tree, so after merging, `.tkus/*/<branch>.jsonl` still names
+the PR's head branch. That is the key for cost per pull request. A branch name
+reused for a later PR is disambiguated by entry timestamps.
+
+---
+
 ## Windows
 
 Windows is a supported platform. Install exactly as above, from PowerShell,
@@ -317,7 +372,7 @@ transcript store.
 | `tkus install [--local-only]` | Install hooks; `--local-only` keeps cost out of the repo |
 | `tkus uninstall` | Remove them, restoring any displaced hooks |
 | `tkus report [--all]` | Usage not yet attributed to a commit |
-| `tkus rollup [--by branch\|identity\|date]` | Totals from the tracked ledger |
+| `tkus rollup [--by branch\|identity\|date] [--json]` | Totals from the tracked ledger |
 | `tkus log [--branch N] [--total]` | Per-commit cost for one branch |
 | `tkus rename [<old> [<new>]]` | Carry a branch's ledger over after its name changed |
 | `tkus reprice` | Re-price the ledger with the current rate table |
@@ -678,7 +733,7 @@ Ledger entries already committed are ordinary files and stay in history.
 ```sh
 git clone https://github.com/natekot/tkus.git
 cd tkus
-python3 -m unittest discover -s tests -t .      # 286 tests
+python3 -m unittest discover -s tests -t .      # 299 tests
 ```
 
 The suite includes regressions pinned to redacted snapshots of real agent data

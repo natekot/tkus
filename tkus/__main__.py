@@ -287,26 +287,39 @@ def cmd_rollup(args) -> int:
     root = repo_root()
     groups = _grouped(root, args.by)
     if not groups:
-        print("no committed ledger entries under %s/" % repoledger.LEDGER_DIR)
+        # stdout stays machine-readable, so the note goes to stderr whenever
+        # something is parsing us.
+        out = sys.stderr if args.json else sys.stdout
+        out.write("no committed ledger entries under %s/\n" % repoledger.LEDGER_DIR)
         if repoledger.is_ignored(root):
-            print("(%s is in .gitignore, so cost is recorded locally only -- "
-                  "see `tkus show`)" % repoledger.LEDGER_DIR)
+            out.write("(%s is in .gitignore, so cost is recorded locally only -- "
+                      "see `tkus show`)\n" % repoledger.LEDGER_DIR)
         elif not repoledger.enabled(RateTable.load(root)):
-            print("(running --local-only, so cost is recorded in .git/ only -- "
-                  "see `tkus show`)")
-        return 0
+            out.write("(running --local-only, so cost is recorded in .git/ only -- "
+                      "see `tkus show`)\n")
+        if not args.json:
+            return 0
 
-    width = max(len(name) for name in groups)
+    rows = []
     grand = 0.0
     currency = "USD"
-    print("%-*s %8s %10s" % (width, args.by, "entries", "cost"))
-    print("-" * (width + 20))
     for name in sorted(groups):
         entries = groups[name]
         total = sum(float(e.get("usd") or 0.0) for e in entries)
         currency = entries[0].get("currency", currency)
         grand += total
-        print("%-*s %8d %10.2f" % (width, name, len(entries), total))
+        rows.append({"name": name, "entries": len(entries), "usd": total})
+
+    if args.json:
+        print(json.dumps({"by": args.by, "currency": currency, "total": grand,
+                          "groups": rows}, indent=2, sort_keys=True))
+        return 0
+
+    width = max(len(row["name"]) for row in rows)
+    print("%-*s %8s %10s" % (width, args.by, "entries", "cost"))
+    print("-" * (width + 20))
+    for row in rows:
+        print("%-*s %8d %10.2f" % (width, row["name"], row["entries"], row["usd"]))
     print("-" * (width + 20))
     print("%-*s %8s %10.2f  %s" % (width, "TOTAL", "", grand, currency))
     return 0
@@ -1133,6 +1146,8 @@ def build_parser() -> argparse.ArgumentParser:
     rollup = sub.add_parser("rollup", help="totals from the tracked ledger")
     rollup.add_argument("--by", choices=("branch", "identity", "date"),
                         default="branch")
+    rollup.add_argument("--json", action="store_true",
+                        help="emit the totals as JSON")
     rollup.set_defaults(func=cmd_rollup)
 
     log = sub.add_parser("log", help="per-commit cost for one branch")
