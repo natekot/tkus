@@ -394,11 +394,11 @@ explicit figure wins:
 
 Fable 5.1 and Mythos 5.1 are the models that need it: they price cache reads at
 $0.25/MTok against a $10 input rate — 0.025x, where every other model is 0.1x.
-Opus 5.5 does too, at $0.20/MTok against $4 input — 0.05x. Deriving those would
-overstate cached reads **two- to fourfold**, and cached reads
-dominate real agent usage. The `cache` key is per field, so anything left out
-of it is still derived; `tkus rates --check` reports a tier whose cache prices
-the table neither states nor derives correctly.
+Opus 5.5 does too, at $0.20/MTok against $4 input — 0.05x — and in fast mode at
+$0.40 against $8. Deriving those would overstate cached reads **two- to
+fourfold**, and cached reads dominate real agent usage. The `cache` key is per
+field, so anything left out of it is still derived; `tkus rates --check` reports
+a tier whose cache prices the table neither states nor derives correctly.
 
 ```
 USD per 1M tokens

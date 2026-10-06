@@ -374,3 +374,46 @@ class TestBundledOpus55(unittest.TestCase):
         cost = compute_cost(
             [record(model="claude-opus-5", input_tokens=MTOK)], self.table)
         self.assertAlmostEqual(cost.total, 5.0, places=6)
+
+
+class TestBundledOpus55Fast(unittest.TestCase):
+    """Opus 5.5's fast mode: $8/$40, with the cache multipliers on top -- so
+    cache reads stay at 0.05x and come to $0.40, not the derived $0.80.
+
+    The catalog has no speed dimension, so these come from Anthropic's pricing
+    page. Without a fast window a fast request falls back to the standard one
+    and is priced at half.
+    """
+
+    def setUp(self):
+        self.table = RateTable.load(None)
+
+    def test_fast_is_double_standard_including_cache_reads(self):
+        cost = compute_cost(
+            [record(model="claude-opus-5-5", speed="fast", input_tokens=MTOK,
+                    output_tokens=MTOK, cache_read=MTOK)], self.table)
+        self.assertAlmostEqual(cost.total, 2 * (24.0 + 0.2), places=6)
+
+    def test_fast_cache_writes_follow_the_multipliers(self):
+        self.assertEqual(
+            self.table.cache_rates("claude-opus-5-5", "fast", at("2026-10-06")),
+            (16.0, 10.0, 0.4))
+
+
+class TestBundledSonnet55(unittest.TestCase):
+    """Sonnet 5.5 is on the ordinary multiple: $2/$10, cache reads $0.20."""
+
+    def setUp(self):
+        self.table = RateTable.load(None)
+
+    def test_sonnet_5_5_is_priced(self):
+        cost = compute_cost(
+            [record(model="claude-sonnet-5-5", input_tokens=MTOK,
+                    output_tokens=MTOK)], self.table)
+        self.assertEqual(cost.unpriced_models, [])
+        self.assertAlmostEqual(cost.total, 12.0, places=6)
+
+    def test_cache_prices_derive(self):
+        self.assertEqual(
+            self.table.cache_rates("claude-sonnet-5-5", "standard", at("2026-10-06")),
+            (4.0, 2.5, 0.2))
