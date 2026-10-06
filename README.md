@@ -219,7 +219,15 @@ falling back to `user.name`, with slashes replaced by `-`. `<branch>` keeps its
 slashes as nested directories, so `feature/x` is `.tkus/<identity>/feature/x.jsonl`.
 A detached HEAD files under `detached`. In both names, characters that Windows
 forbids in filenames (`<>:"\|?*` and control characters) become `-`, so a path
-matches the branch name exactly unless it contained one of those. A renamed
+matches the branch name exactly unless it contained one of those.
+
+**Tags.** Usage filed with [`tkus tag`](#work-that-belongs-to-no-branch) lives
+at `.tkus/<identity>/.tags/<name>/<until>.jsonl`, one file per occurrence, so
+reusing a name on two open pull requests never conflicts. `<until>` is the end
+of its window, as `YYYYMMDDTHHMMSS.mmmZ`. Git rejects a branch name with a
+component that starts with `.`, so a path with `.tags` as its third component
+is always a tag, never a branch. Its entries are in the same format as a
+branch's. A renamed
 branch's entries move to its new file at the next commit; until then, or when
 tkus cannot see the rename, they stay under the old name (see [Known
 limitations](#known-limitations)).
@@ -375,6 +383,7 @@ transcript store.
 | `tkus rollup [--by branch\|identity\|date] [--json]` | Totals from the tracked ledger |
 | `tkus log [--branch N] [--total]` | Per-commit cost for one branch |
 | `tkus rename [<old> [<new>]]` | Carry a branch's ledger over after its name changed |
+| `tkus tag [<name>] [--undo]` | File the usage since the last commit under a name instead of a branch |
 | `tkus reprice` | Re-price the ledger with the current rate table |
 | `tkus show [<commit>]` | Per-commit detail from the local `.git/` ledger |
 | `tkus rates [--at DATE] [--json]` | The rate table used for pricing |
@@ -429,6 +438,45 @@ The coverage line is how you judge the breakdown: it reports how many of the
 branch's commits carry usage at all — commits made before `tkus install`, or
 with no agent usage, are simply absent from the table — and how many entries
 are orphaned.
+
+### Work that belongs to no branch
+
+Every commit claims the usage since the one before it, on whatever branch it
+is on. So an hour spent planning on `main`, with nothing to commit there, is
+billed to the first commit of whichever feature branch comes next. `tkus tag`
+says what that work was instead:
+
+```
+$ tkus tag strategy
+tagged 3.10 USD as strategy (2026-10-06 10:34 -> 15:24 UTC)
+it lands in your next commit, on whichever branch that is
+```
+
+Nothing is committed yet, and nothing has to be committed on `main`. The tag is
+a marker in `.git/`, and your next commit, **on any branch**, splits its window
+there: the usage up to the tag goes to its own file, and only what came after
+goes to the branch. The tag reaches the default branch when that commit's pull
+request merges, and `tkus rollup` shows it as its own row:
+
+```
+branch                 entries       cost
+------------------------------------------
+feature/cache-rewrite        6       8.49
+main                        14      31.02
+tag:strategy                 2       3.10
+------------------------------------------
+TOTAL                                42.61  USD
+```
+
+Names are reusable buckets: tag `strategy` as often as you like and the row
+sums them. Tagging the same name again before committing extends that tag
+rather than adding a second. `tkus tag` with no name lists tags waiting for a
+commit, `tkus tag --undo` drops the newest one, and `tkus report` shows pending
+tags apart from the usage your next commit's branch will claim.
+
+It refuses when there is nothing to tag, when the hooks are not installed (no
+commit would ever record it), and in a `--local-only` repository, because tags
+exist only in the tracked ledger. It has nothing to do with git tags.
 
 ### Seeing the rates
 
@@ -696,7 +744,11 @@ per-developer spend visible to everyone with repository access.
   commit.
 - **Long gaps.** A commit made after days of uncommitted work absorbs all of it.
 - **Interleaved branches** share one repository-level cursor, so usage lands on
-  whichever branch commits first.
+  whichever branch commits first. For work that belongs to no branch at all,
+  `tkus tag` files it separately.
+- **A tag travels with the commit that carries it.** It reaches the default
+  branch only when that commit's branch merges; a branch that is never merged
+  takes its tags with it.
 - **Branch renames are found through the local reflog.** The next commit
   after `git branch -m old new` folds `old.jsonl` into `new.jsonl`, unless a
   branch named `old` exists again. A rename the reflog can't see — made in
@@ -733,7 +785,7 @@ Ledger entries already committed are ordinary files and stay in history.
 ```sh
 git clone https://github.com/natekot/tkus.git
 cd tkus
-python3 -m unittest discover -s tests -t .      # 299 tests
+python3 -m unittest discover -s tests -t .      # 326 tests
 ```
 
 The suite includes regressions pinned to redacted snapshots of real agent data

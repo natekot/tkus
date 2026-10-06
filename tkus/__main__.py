@@ -24,7 +24,8 @@ from .pricing import (RateTable, RateTableError, compute_cost,
                       compute_cost_from_totals)
 from .providers import claude_code  # noqa: F401  (registers the provider)
 from .providers import copilot  # noqa: F401  (registers the provider)
-from .providers.base import aggregate_by_model, collect_all, format_timestamp
+from .providers.base import (aggregate_by_model, collect_all, format_timestamp,
+                             parse_timestamp)
 
 
 
@@ -88,6 +89,81 @@ def head_sha(root: str) -> Optional[str]:
 # hooks
 # --------------------------------------------------------------------------
 
+def _window_entry(root, records, table, since, until):
+    # type: (str, list, RateTable, Optional[datetime], datetime) -> dict
+    """A ledger entry for the usage in (since, until]."""
+    cost = compute_cost(records, table, when=None)
+    entry = ledger.build_entry(aggregate_by_model(records), cost, at=until)
+    entry["since"] = format_timestamp(since) if since else None
+    entry["until"] = format_timestamp(until)
+    # The new commit's SHA does not exist yet; its parent does, and identifies
+    # the commit on linear history.
+    entry["parent"] = head_sha(root)
+    entry.pop("sha", None)
+    return entry
+
+
+def _files_to_repo(root, table, rel):
+    # type: (str, RateTable, str) -> bool
+    """Whether `rel` is committed to the repository. The local ledger is
+    always written; this part is optional -- and .gitignore counts as saying
+    no, provided the file is not already tracked."""
+    return repoledger.enabled(table) and (
+        repoledger.is_tracked(root, rel) or not repoledger.is_ignored(root, rel))
+
+
+def _split_at_tags(since, records, tags):
+    # type: (Optional[datetime], list, List[dict]) -> tuple
+    """Divide time-ordered records at each pending tag's `until`.
+
+    Returns (rows, start, rest): one row per tag with the window and records
+    it claims, then where the untagged remainder begins and its records. Each
+    tag starts where the one before it ended, so the windows meet without
+    overlapping, and the remainder is exactly what the branch claims.
+    """
+    rows = []
+    start = since
+    rest = list(records)
+    for tag in tags:
+        until = parse_timestamp(tag["until"])
+        rows.append({"name": tag["name"], "since": start, "until": until,
+                     "records": [r for r in rest if r.timestamp <= until]})
+        rest = [r for r in rest if r.timestamp > until]
+        if start is None or until > start:
+            start = until
+    return rows, start, rest
+
+
+def _file_tags(root, table, since, records):
+    # type: (str, RateTable, Optional[datetime], list) -> tuple
+    """Write each pending tag's usage to a file of its own, and stage it.
+
+    Returns what is left for the branch -- where its window starts, and its
+    records -- plus the markers handled, for post-commit to clear. With
+    nowhere to file a tag, its usage stays in the commit's own entry, exactly
+    as it would have without the tag.
+    """
+    tags = cursor_mod.read_tags(root)
+    if not tags:
+        return since, records, []
+    rows, start, rest = _split_at_tags(since, records, tags)
+    if not _files_to_repo(root, table,
+                          repoledger.tag_file(root, tags[0]["name"], now())):
+        return since, records, tags
+    for row in rows:
+        if not row["records"]:
+            continue
+        rel = repoledger.tag_file(root, row["name"], row["until"])
+        # Already in HEAD means a commit carried it but post-commit never
+        # cleared the marker. Writing it again would count it twice.
+        if repoledger.read_committed(root, rel):
+            continue
+        repoledger.write_entry(
+            root, _window_entry(root, row["records"], table, row["since"],
+                                row["until"]), rel)
+    return start, rest, tags
+
+
 def hook_pre_commit(root: str, argv: List[str]) -> int:
     """Record the window into the tracked ledger and stage it.
 
@@ -98,34 +174,20 @@ def hook_pre_commit(root: str, argv: List[str]) -> int:
     window_end = now()
     since = cursor_mod.cursor_since(root)
     records = collect_all(root, since, window_end)
-    totals = aggregate_by_model(records)
-    if not totals:
+    since, records, tags = _file_tags(root, table, since, records)
+    if not records:
         if repoledger.enabled(table):
             rel = repoledger.relative_path(root)
-            if repoledger.pending_fold(root, rel) and (
-                    repoledger.is_tracked(root, rel)
-                    or not repoledger.is_ignored(root, rel)):
+            if repoledger.pending_fold(root, rel) and _files_to_repo(root, table, rel):
                 repoledger.write_entry(root, None, rel)
-        cursor_mod.write_pending(root, window_end)
+        cursor_mod.write_pending(root, window_end, tags=tags)
         return 0
 
-    cost = compute_cost(records, table, when=None)
-    entry = ledger.build_entry(totals, cost, at=window_end)
-    entry["since"] = format_timestamp(since) if since else None
-    entry["until"] = format_timestamp(window_end)
-    # The new commit's SHA does not exist yet; its parent does, and identifies
-    # the commit on linear history.
-    entry["parent"] = head_sha(root)
-    entry.pop("sha", None)
-
-    # The local ledger is always written (via post-commit, which knows the SHA).
-    # Only committing it to the repository is optional -- and .gitignore counts
-    # as saying no, provided the file is not already tracked.
-    if repoledger.enabled(table):
-        rel = repoledger.relative_path(root)
-        if repoledger.is_tracked(root, rel) or not repoledger.is_ignored(root, rel):
-            repoledger.write_entry(root, entry, rel)
-    cursor_mod.write_pending(root, window_end, detail=entry)
+    entry = _window_entry(root, records, table, since, window_end)
+    rel = repoledger.relative_path(root)
+    if _files_to_repo(root, table, rel):
+        repoledger.write_entry(root, entry, rel)
+    cursor_mod.write_pending(root, window_end, detail=entry, tags=tags)
     return 0
 
 
@@ -241,16 +303,98 @@ def _print_table(totals, cost) -> None:
 
 def cmd_report(args) -> int:
     root = repo_root()
+    table = RateTable.load(root)
     since = None if args.all else cursor_mod.cursor_since(root)
     records = collect_all(root, since, now())
-    cost = compute_cost(records, RateTable.load(root), when=None)
     if args.all:
         print("All recorded usage for %s\n" % root)
     else:
+        rows, since, records = _split_at_tags(since, records,
+                                              cursor_mod.read_tags(root))
+        if rows:
+            _print_pending_tags(rows, table)
+            print()
         print("Unattributed usage since %s\n"
               % (since.isoformat() if since else "the beginning"))
-    _print_table(aggregate_by_model(records), cost)
+    _print_table(aggregate_by_model(records),
+                 compute_cost(records, table, when=None))
     _warn_if_not_installed(root)
+    return 0
+
+
+def _when(stamp: Optional[datetime]) -> str:
+    return stamp.strftime("%Y-%m-%d %H:%M") if stamp else "the beginning"
+
+
+def _span(since: Optional[datetime], until: datetime) -> str:
+    """A window in UTC, naming its date once when it fits in one day."""
+    end = until.strftime("%H:%M") if since and since.date() == until.date() \
+        else _when(until)
+    return "(%s -> %s UTC)" % (_when(since), end)
+
+
+def _print_pending_tags(rows, table) -> None:
+    print("Tagged, waiting for your next commit on any branch:")
+    width = max(len(row["name"]) for row in rows)
+    for row in rows:
+        cost = compute_cost(row["records"], table, when=None)
+        print("  %-*s %10s %s  %s" % (
+            width, row["name"], _money(cost.total), cost.currency,
+            _span(row["since"], row["until"])))
+
+
+def cmd_tag(args) -> int:
+    """File the usage since the last commit under a name, not a branch.
+
+    For work no branch should pay for -- planning on `main`, say. Without it,
+    the next commit claims that usage for whatever branch it is on.
+
+    Nothing is written to the ledger here. The tag is a marker in .git/ that
+    the next commit, on any branch, splits its window at: so the cursor still
+    advances only once a commit exists, and --undo is a deletion.
+    """
+    root = repo_root()
+    if args.undo:
+        dropped = cursor_mod.drop_last_tag(root)
+        if not dropped:
+            sys.stderr.write("tkus: no pending tag to undo\n")
+            return 1
+        print("dropped %s; its usage is untagged again" % dropped["name"])
+        return 0
+
+    table = RateTable.load(root)
+    until = now()
+    since = cursor_mod.cursor_since(root)
+    tags = cursor_mod.read_tags(root)
+    rows, start, rest = _split_at_tags(since, collect_all(root, since, until), tags)
+    if not args.name:
+        if not rows:
+            print("no pending tags")
+        else:
+            _print_pending_tags(rows, table)
+        return 0
+
+    name = repoledger.clean_tag(args.name)
+    if not hooks.is_installed(root):
+        sys.stderr.write("tkus: not installed in this repository, so no commit "
+                         "would ever record this tag. Run `tkus install` first.\n")
+        return 1
+    if not _files_to_repo(root, table, repoledger.tag_file(root, name, until)):
+        sys.stderr.write("tkus: tags are filed in the tracked %s/ ledger, and "
+                         "this repository keeps cost in .git/ only\n"
+                         % repoledger.LEDGER_DIR)
+        return 1
+    if not rest:
+        sys.stderr.write("tkus: nothing to tag -- no usage since %s UTC\n"
+                         % _when(start))
+        return 1
+
+    if cursor_mod.add_tag(root, name, until):
+        start, rest = rows[-1]["since"], rows[-1]["records"] + rest
+    cost = compute_cost(rest, table, when=None)
+    print("tagged %s %s as %s %s" % (
+        _money(cost.total), cost.currency, name, _span(start, until)))
+    print("it lands in your next commit, on whichever branch that is")
     return 0
 
 
@@ -266,16 +410,24 @@ def _ledger_scope(rel: str) -> tuple:
     return parts[1], "/".join(parts[2:]).rsplit(".jsonl", 1)[0]
 
 
+# A tag's row in `rollup --by branch`. Git forbids ":" in a branch name, so no
+# branch can ever be mistaken for one.
+TAG_PREFIX = "tag:"
+
+
 def _grouped(root: str, key: str):
     """Ledger entries grouped for reporting."""
     groups = OrderedDict()  # type: Dict[str, list]
     for rel, entries in sorted(repoledger.read_all(root).items()):
         who, branch = _ledger_scope(rel)
+        tag = repoledger.tag_name(rel)
         for entry in entries:
             if key == "identity":
                 name = who
             elif key == "date":
                 name = (entry.get("until") or entry.get("at") or "")[:10] or "unknown"
+            elif tag is not None:
+                name = TAG_PREFIX + tag
             else:
                 name = branch
             groups.setdefault(name, []).append(entry)
@@ -303,12 +455,16 @@ def cmd_rollup(args) -> int:
     rows = []
     grand = 0.0
     currency = "USD"
-    for name in sorted(groups):
+    # Branches first, then tags: a tag is the exception, not the work.
+    for name in sorted(groups, key=lambda n: (n.startswith(TAG_PREFIX), n)):
         entries = groups[name]
         total = sum(float(e.get("usd") or 0.0) for e in entries)
         currency = entries[0].get("currency", currency)
         grand += total
-        rows.append({"name": name, "entries": len(entries), "usd": total})
+        row = {"name": name, "entries": len(entries), "usd": total}
+        if args.by == "branch":
+            row["kind"] = "tag" if name.startswith(TAG_PREFIX) else "branch"
+        rows.append(row)
 
     if args.json:
         print(json.dumps({"by": args.by, "currency": currency, "total": grand,
@@ -588,6 +744,8 @@ def _list_rename_candidates(root: str) -> int:
         who, branch = _ledger_scope(rel)
         if who != mine or branch == current or repoledger.branch_exists(root, branch):
             continue
+        if repoledger.tag_name(rel) is not None:
+            continue                # a tag was never a branch
         entries = repoledger.read_committed(root, rel)
         if entries:
             rows.append((branch, len(entries), _usd(entries)))
@@ -610,7 +768,6 @@ def cmd_reprice(args) -> int:
     """
     root = repo_root()
     table = RateTable.load(root)
-    from .providers.base import parse_timestamp
 
     grand_old = grand_new = 0.0
     rows = 0
@@ -1166,6 +1323,16 @@ def build_parser() -> argparse.ArgumentParser:
     rename.add_argument("new", nargs="?",
                         help="the branch it continued as (default: the current one)")
     rename.set_defaults(func=cmd_rename)
+
+    tag = sub.add_parser(
+        "tag", help="file the usage since the last commit under a name, not a "
+                    "branch (unrelated to git tags)")
+    tag.add_argument("name", nargs="?",
+                     help="what the work was, e.g. strategy (omit to list "
+                          "tags waiting for a commit)")
+    tag.add_argument("--undo", action="store_true",
+                     help="drop the newest pending tag")
+    tag.set_defaults(func=cmd_tag)
 
     reprice = sub.add_parser("reprice",
                              help="re-price the ledger with the current rates")

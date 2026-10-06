@@ -15,13 +15,14 @@ import json
 import os
 import subprocess
 from datetime import datetime
-from typing import Optional
+from typing import List, Optional
 
 from .providers.base import format_timestamp, parse_timestamp
 
 STATE_DIR = "tkus"
 CURSOR_FILE = "cursor.json"
 PENDING_FILE = "pending.json"
+TAGS_FILE = "tags.json"
 
 
 def git_dir(repo_root: str) -> str:
@@ -83,16 +84,19 @@ def cursor_since(repo_root: str, amending: bool = False) -> Optional[datetime]:
     return parse_timestamp(value) if value else None
 
 
-def write_pending(repo_root, window_end, amending=False, detail=None):
-    # type: (str, datetime, bool, Optional[dict]) -> None
+def write_pending(repo_root, window_end, amending=False, detail=None, tags=None):
+    # type: (str, datetime, bool, Optional[dict], Optional[List[dict]]) -> None
     """Record the in-flight window, plus the detail post-commit will file.
 
     `detail` rides along because the commit SHA does not exist yet: only
-    post-commit can key a ledger entry to it.
+    post-commit can key a ledger entry to it. `tags` are the markers this
+    commit filed, for post-commit to clear once the commit exists.
     """
     payload = {"window_end": format_timestamp(window_end), "amending": bool(amending)}
     if detail is not None:
         payload["detail"] = detail
+    if tags:
+        payload["tags"] = tags
     _write(os.path.join(state_dir(repo_root), PENDING_FILE), payload)
 
 
@@ -127,6 +131,7 @@ def promote_pending(repo_root: str) -> Optional[datetime]:
         new_state["prev_ts"] = state["prev_ts"]
 
     _write(os.path.join(directory, CURSOR_FILE), new_state)
+    clear_tags(repo_root, pending.get("tags") or [])
     try:
         os.remove(pending_path)
     except OSError:
@@ -134,9 +139,69 @@ def promote_pending(repo_root: str) -> Optional[datetime]:
     return parse_timestamp(window_end)
 
 
+def read_tags(repo_root: str) -> List[dict]:
+    """Pending `tkus tag` markers, oldest first: {"name", "until"} each.
+
+    A marker is not an entry. It only says where a named stretch of usage
+    ended; the next commit splits its window there. Keeping it that way means
+    the cursor still advances only once a commit exists, and undoing a tag is
+    a deletion.
+    """
+    data = _read(os.path.join(state_dir(repo_root, create=False), TAGS_FILE))
+    tags = data.get("tags")
+    if not isinstance(tags, list):
+        return []
+    return [t for t in tags if isinstance(t, dict) and t.get("name")
+            and parse_timestamp(t.get("until"))]
+
+
+def _write_tags(repo_root: str, tags: List[dict]) -> None:
+    path = os.path.join(state_dir(repo_root), TAGS_FILE)
+    if tags:
+        _write(path, {"tags": tags})
+    else:
+        try:
+            os.remove(path)
+        except OSError:
+            pass
+
+
+def add_tag(repo_root: str, name: str, until: datetime) -> bool:
+    """Mark usage up to `until` as `name`. True when it extended the newest
+    marker instead -- tagging the same work twice is one stretch, not two."""
+    tags = read_tags(repo_root)
+    extended = bool(tags) and tags[-1]["name"] == name
+    if extended:
+        tags[-1]["until"] = format_timestamp(until)
+    else:
+        tags.append({"name": name, "until": format_timestamp(until)})
+    _write_tags(repo_root, tags)
+    return extended
+
+
+def drop_last_tag(repo_root: str) -> Optional[dict]:
+    tags = read_tags(repo_root)
+    if not tags:
+        return None
+    dropped = tags.pop()
+    _write_tags(repo_root, tags)
+    return dropped
+
+
+def clear_tags(repo_root: str, filed: List[dict]) -> None:
+    """Drop exactly the markers a commit filed, and no others."""
+    done = {(t.get("name"), t.get("until")) for t in filed if isinstance(t, dict)}
+    if not done:
+        return
+    tags = read_tags(repo_root)
+    keep = [t for t in tags if (t["name"], t["until"]) not in done]
+    if len(keep) != len(tags):
+        _write_tags(repo_root, keep)
+
+
 def reset(repo_root: str) -> None:
     directory = state_dir(repo_root, create=False)
-    for name in (CURSOR_FILE, PENDING_FILE):
+    for name in (CURSOR_FILE, PENDING_FILE, TAGS_FILE):
         try:
             os.remove(os.path.join(directory, name))
         except OSError:

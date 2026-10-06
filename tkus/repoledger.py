@@ -12,6 +12,11 @@ Per branch so concurrent pull requests never touch the same file, which is the
 merge-conflict problem that rules out a single shared ledger. Per identity so two
 people on similarly-named branches stay separate.
 
+Usage that belongs to no branch is filed by `tkus tag` instead, one file per
+occurrence for the same reason:
+
+    .tkus/<identity>/.tags/<name>/<until>.jsonl
+
 The file is **rebuilt from HEAD** on every commit rather than appended to. That
 makes an abandoned commit self-correcting: its entry was staged but never
 committed, so it is absent from HEAD and the next commit simply overwrites it.
@@ -24,9 +29,15 @@ import json
 import os
 import re
 import subprocess
+from datetime import datetime, timezone
 from typing import Dict, List, Optional
 
 LEDGER_DIR = ".tkus"
+
+# Where `tkus tag` files usage that belongs to no branch. A leading dot is what
+# makes it safe: git rejects a branch name with any component starting with
+# one, and _sanitize strips it from identities, so neither can ever land here.
+TAGS_DIR = ".tags"
 
 # Characters that are illegal in Windows filenames. Git permits some of them in
 # branch names, and the primary deployment target is Windows.
@@ -302,6 +313,32 @@ def pending_fold(repo_root: str, rel: str) -> bool:
 def branch_file(repo_root: str, branch: str) -> str:
     """This identity's ledger path for a branch other than the current one."""
     return "%s/%s/%s.jsonl" % (LEDGER_DIR, identity(repo_root), _branch_path(branch))
+
+
+def clean_tag(name: str) -> str:
+    """A tag name as its path will spell it: sanitised like a branch name."""
+    return _branch_path(name)
+
+
+def tag_file(repo_root: str, name: str, until: datetime) -> str:
+    """This identity's file for one tag's usage up to `until`.
+
+    One file per occurrence rather than per name, because names are reused:
+    two open pull requests each adding a line to one shared `strategy.jsonl`
+    would conflict as soon as the second merged. That is the same reason
+    branches get a file each.
+    """
+    stamp = until.astimezone(timezone.utc).strftime("%Y%m%dT%H%M%S.%f")[:-3] + "Z"
+    return "%s/%s/%s/%s/%s.jsonl" % (LEDGER_DIR, identity(repo_root), TAGS_DIR,
+                                     clean_tag(name), stamp)
+
+
+def tag_name(rel: str) -> Optional[str]:
+    """The tag a ledger path holds, or None for a branch's file."""
+    parts = rel.split("/")
+    if len(parts) < 5 or parts[0] != LEDGER_DIR or parts[2] != TAGS_DIR:
+        return None
+    return "/".join(parts[3:-1])
 
 
 def _merge(first: List[dict], then: List[dict]) -> List[dict]:
