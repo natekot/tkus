@@ -61,7 +61,7 @@ class RepoLedgerTestCase(unittest.TestCase):
                                  % (" ".join(args), out.stderr.decode()))
         return out.stdout.decode()
 
-    def inject_usage(self, output_tokens=1000):
+    def inject_usage(self, output_tokens=1000, model="claude-opus-5"):
         """One synthetic Claude request attributable to this repo."""
         self.counter += 1
         encoded = os.path.realpath(self.repo).replace(os.sep, "-")
@@ -75,7 +75,7 @@ class RepoLedgerTestCase(unittest.TestCase):
                 "type": "assistant", "requestId": "r%d" % self.counter,
                 "cwd": os.path.realpath(self.repo),
                 "timestamp": stamp.strftime("%Y-%m-%dT%H:%M:%S.%f")[:-3] + "Z",
-                "message": {"model": "claude-opus-5", "usage": {
+                "message": {"model": model, "usage": {
                     "input_tokens": 0, "output_tokens": output_tokens,
                     "cache_read_input_tokens": 0,
                     "cache_creation": {"ephemeral_1h_input_tokens": 0,

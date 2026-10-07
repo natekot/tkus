@@ -160,7 +160,7 @@ def _file_tags(root, table, since, records):
             continue
         repoledger.write_entry(
             root, _window_entry(root, row["records"], table, row["since"],
-                                row["until"]), rel)
+                                row["until"]), rel, table)
     return start, rest, tags
 
 
@@ -179,14 +179,14 @@ def hook_pre_commit(root: str, argv: List[str]) -> int:
         if repoledger.enabled(table):
             rel = repoledger.relative_path(root)
             if repoledger.pending_fold(root, rel) and _files_to_repo(root, table, rel):
-                repoledger.write_entry(root, None, rel)
+                repoledger.write_entry(root, None, rel, table)
         cursor_mod.write_pending(root, window_end, tags=tags)
         return 0
 
     entry = _window_entry(root, records, table, since, window_end)
     rel = repoledger.relative_path(root)
     if _files_to_repo(root, table, rel):
-        repoledger.write_entry(root, entry, rel)
+        repoledger.write_entry(root, entry, rel, table)
     cursor_mod.write_pending(root, window_end, detail=entry, tags=tags)
     return 0
 
@@ -768,9 +768,11 @@ def cmd_reprice(args) -> int:
     """
     root = repo_root()
     table = RateTable.load(root)
+    if args.fill:
+        return _fill_unpriced(root, table, args.yes)
 
     grand_old = grand_new = 0.0
-    rows = 0
+    rows = fillable = 0
     for rel, entries in sorted(repoledger.read_all(root).items()):
         for entry in entries:
             totals = ledger.totals_from_entry(entry)
@@ -781,6 +783,7 @@ def cmd_reprice(args) -> int:
             grand_old += float(entry.get("usd") or 0.0)
             grand_new += cost.total
             rows += 1
+            fillable += len(_filled_rows(entry, ledger.fill_unpriced(entry, table)))
     if not rows:
         print("no ledger entries to re-price")
         return 0
@@ -790,6 +793,68 @@ def cmd_reprice(args) -> int:
     delta = grand_new - grand_old
     if abs(delta) >= 0.005:
         print("difference   %+.2f" % delta)
+    if fillable:
+        print("unpriced     %d row%s now ha%s a rate; `tkus reprice --fill` "
+              "records %s" % (fillable, "" if fillable == 1 else "s",
+                              "s" if fillable == 1 else "ve",
+                              "it" if fillable == 1 else "them"))
+    return 0
+
+
+def _filled_rows(entry, filled):
+    # type: (dict, Optional[dict]) -> List[dict]
+    """The rows `ledger.fill_unpriced` priced, as they now read."""
+    if not filled:
+        return []
+    return [new for old, new in zip(entry.get("providers") or [],
+                                    filled["providers"])
+            if new.get("filled") and not old.get("filled")]
+
+
+def _fill_unpriced(root, table, write):
+    # type: (str, RateTable, bool) -> int
+    """Price ledger rows recorded before their model had a rate.
+
+    Every identity's files, not only ours: a row at zero is wrong whoever
+    recorded it, and the fill is deterministic, so two people doing it to the
+    same line merge cleanly. Read from HEAD like every other ledger write.
+    """
+    changed = []
+    added = 0.0
+    currency = table.currency
+    for rel in repoledger.all_files(root):
+        entries = repoledger.read_committed(root, rel)
+        rows = []
+        for i, entry in enumerate(entries):
+            filled = ledger.fill_unpriced(entry, table)
+            if filled:
+                entries[i] = filled
+                added += filled["usd"] - float(entry.get("usd") or 0.0)
+                currency = entry.get("currency", currency)
+                day = (entry.get("until") or entry.get("at") or "")[:10]
+                rows.extend((day, row) for row in _filled_rows(entry, filled))
+        if not rows:
+            continue
+        changed.append((rel, entries))
+        print(rel)
+        width = max(len(row["model"]) for _, row in rows)
+        for day, row in rows:
+            tokens = sum(int(row.get(name) or 0) for name in ledger.PRICED)
+            print("  %s  %-*s %14s tokens %10s" % (day, width, row["model"],
+                                                   "{:,}".format(tokens),
+                                                   _money(row["usd"])))
+
+    if not changed:
+        print("nothing to fill: every row whose model has a rate is priced")
+        return 0
+    print("\nadds %.2f %s across %d file%s" % (
+        added, currency, len(changed), "" if len(changed) == 1 else "s"))
+    if not write:
+        print("dry run. Re-run with --yes to write it.")
+        return 0
+    for rel, entries in changed:
+        repoledger.rewrite(root, rel, entries)
+    print("staged; it lands in your next commit")
     return 0
 
 
@@ -1336,6 +1401,11 @@ def build_parser() -> argparse.ArgumentParser:
 
     reprice = sub.add_parser("reprice",
                              help="re-price the ledger with the current rates")
+    reprice.add_argument("--fill", action="store_true",
+                         help="price rows recorded before their model had a "
+                              "rate; a dry run unless --yes is given")
+    reprice.add_argument("--yes", action="store_true",
+                         help="with --fill, rewrite and stage the ledger files")
     reprice.set_defaults(func=cmd_reprice)
 
     show = sub.add_parser("show", help="per-commit detail from the local ledger")

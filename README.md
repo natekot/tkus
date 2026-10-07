@@ -250,6 +250,7 @@ limitations](#known-limitations)).
 | `currency`, `usd` | Total cost of the entry |
 | `rates_version` | Version of the rate table that priced it |
 | `providers[]` | One row per provider and model: `provider`, `model`, `usd`, and token counters |
+| `providers[].filled` | `true` on a row priced after it was recorded, because its model had no rate then (see [Filling in a model priced late](#filling-in-a-model-priced-late)) |
 
 The counters are `reqs` (requests), `in` (uncached input), `out`, `cr` (cache
 reads), `cw1h` and `cw5m` (cache writes by TTL), `ws` (web searches), `reas`
@@ -261,7 +262,9 @@ meaning. Readers should ignore fields they do not recognise, and treat a missing
 counter as zero. A committed entry's content is never rewritten — a branch
 rename moves it to another file unchanged — so `usd` is the price when it was
 recorded, and `tkus reprice` only reports what the same tokens would cost
-today.
+today. The one exception is a row recorded before its model had any rate: once
+one exists, it is priced and marked `"filled": true`, and its entry's `usd`
+grows to match. Nothing that already had a price is ever changed.
 
 **Joining to pull requests.** Squash+merge keeps a branch's ledger file in the
 default branch's tree, so after merging, `.tkus/*/<branch>.jsonl` still names
@@ -385,6 +388,7 @@ transcript store.
 | `tkus rename [<old> [<new>]]` | Carry a branch's ledger over after its name changed |
 | `tkus tag [<name>] [--undo]` | File the usage since the last commit under a name instead of a branch |
 | `tkus reprice` | Re-price the ledger with the current rate table |
+| `tkus reprice --fill [--yes]` | Price rows recorded before their model had a rate |
 | `tkus show [<commit>]` | Per-commit detail from the local `.git/` ledger |
 | `tkus rates [--at DATE] [--json]` | The rate table used for pricing |
 | `tkus rates --check` | Compare against the installed Claude Code; exit 1 on drift |
@@ -570,6 +574,37 @@ When a price does change, the old window is **closed** rather than rewritten, so
 > any Claude Code release. It never raises: if the catalog cannot be read, tkus
 > says so and keeps using the bundled table.
 
+### Filling in a model priced late
+
+A model released after your copy of the rate table is not priced at zero: the
+commit's report says it is unpriced. But its ledger row is still committed,
+with only its web searches in `usd`, so adding the rate later leaves that money
+missing from `rollup` and `log`. `tkus reprice` says when that has happened,
+and `--fill` puts it right:
+
+```
+$ tkus reprice --fill
+.tkus/nate-kot/fix-amend-rename-attribution.jsonl
+  2026-09-25  claude-opus-5-5      3,366,900 tokens   2.962351
+
+adds 2.96 USD across 1 file
+dry run. Re-run with --yes to write it.
+```
+
+With `--yes` it rewrites those lines and stages them, so they land in your
+next commit. Every identity's files are filled, not only yours, because a row at
+zero is wrong whoever recorded it. The rewrite is identical for anyone who runs
+it, so two people filling the same line merge cleanly. Each filled row is
+marked `"filled": true`, and it keeps its key, so `tkus log` still credits the
+commit that recorded it.
+
+Your next commit on a branch fills that branch's own file anyway. It has to:
+the commit rebuilds the file from `HEAD`, where the row is still unpriced.
+
+A ledger row records no speed, so a filled row is priced at the standard rate,
+the same way `tkus reprice` prices everything. Fast-mode usage of a model that
+had no rate is understated by the difference.
+
 ### Reading does not require installing
 
 `tkus report` works in **any** git repository, whether or not `tkus install` has
@@ -666,7 +701,9 @@ The figure is designed to be reconcilable against a real invoice.
 - **Per-model breakdown**, since one commit routinely spans models priced from
   $1/$5 to $10/$50 per MTok.
 - **Fast mode and batch tier** are read from the transcript and priced accordingly.
-- **Unknown models are flagged, never priced at zero.**
+- **Unknown models are flagged, never priced at zero.** Their rows are filled
+  in once a rate exists — see [Filling in a model priced
+  late](#filling-in-a-model-priced-late).
 
 ### GitHub Copilot
 
@@ -785,7 +822,7 @@ Ledger entries already committed are ordinary files and stay in history.
 ```sh
 git clone https://github.com/natekot/tkus.git
 cd tkus
-python3 -m unittest discover -s tests -t .      # 326 tests
+python3 -m unittest discover -s tests -t .      # 347 tests
 ```
 
 The suite includes regressions pinned to redacted snapshots of real agent data

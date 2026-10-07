@@ -32,6 +32,8 @@ import subprocess
 from datetime import datetime, timezone
 from typing import Dict, List, Optional
 
+from . import ledger
+
 LEDGER_DIR = ".tkus"
 
 # Where `tkus tag` files usage that belongs to no branch. A leading dot is what
@@ -238,28 +240,27 @@ def read_worktree(repo_root: str, rel_path: Optional[str] = None) -> List[dict]:
         return []
 
 
-def write_entry(repo_root, entry, rel_path=None):
-    # type: (str, Optional[dict], Optional[str]) -> str
+def write_entry(repo_root, entry, rel_path=None, table=None):
+    # type: (str, Optional[dict], Optional[str], object) -> str
     """Rebuild the ledger from HEAD plus this entry, and stage it.
 
     Staging is what puts the file in *this* commit rather than the next one.
     With no entry it only folds in a renamed branch's file (see pending_fold).
+
+    Given the rate table, rows recorded before their model had a rate are
+    priced on the way through. That is not optional for `tkus reprice --fill`:
+    HEAD still holds them unpriced, so a rebuild without it would quietly undo
+    a fill staged for this commit.
     """
     rel = rel_path or relative_path(repo_root)
     folded, stale = _renamed_entries(repo_root, rel)
     entries = _merge(folded, read_committed(repo_root, rel))
+    if table is not None:
+        entries = [ledger.fill_unpriced(e, table) or e for e in entries]
     if entry is not None:
         entries.append(entry)
 
-    path = absolute_path(repo_root, rel)
-    directory = os.path.dirname(path)
-    if directory and not os.path.isdir(directory):
-        os.makedirs(directory)
-    with open(path, "w", newline="\n") as fh:
-        for item in entries:
-            fh.write(json.dumps(item, sort_keys=True) + "\n")
-
-    _git(repo_root, ["add", "--", rel])
+    rewrite(repo_root, rel, entries)
     for old in stale:
         # Only once the new file holds its entries. Staged here for the same
         # reason the new file is: so the move lands in *this* commit.
@@ -269,6 +270,19 @@ def write_entry(repo_root, entry, rel_path=None):
         except OSError:
             pass
     return rel
+
+
+def rewrite(repo_root, rel, entries):
+    # type: (str, str, List[dict]) -> None
+    """Write a ledger file's entries, one line each, and stage it."""
+    path = absolute_path(repo_root, rel)
+    directory = os.path.dirname(path)
+    if directory and not os.path.isdir(directory):
+        os.makedirs(directory)
+    with open(path, "w", newline="\n") as fh:
+        for item in entries:
+            fh.write(json.dumps(item, sort_keys=True) + "\n")
+    _git(repo_root, ["add", "--", rel])
 
 
 def _renamed_entries(repo_root, rel):

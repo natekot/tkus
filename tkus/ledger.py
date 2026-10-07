@@ -19,7 +19,8 @@ from datetime import datetime, timezone
 from typing import Dict, List, Optional
 
 from .cursor import state_dir
-from .providers.base import ModelTotals, format_timestamp
+from .pricing import compute_cost_from_totals
+from .providers.base import ModelTotals, format_timestamp, parse_timestamp
 
 LEDGER_FILE = "ledger.jsonl"
 
@@ -82,6 +83,55 @@ def totals_from_entry(entry: dict) -> Dict[tuple, ModelTotals]:
                     pass
         out[totals.key] = totals
     return out
+
+
+# The counters a rate prices. Web searches are priced apart from the model, and
+# reasoning tokens are already inside `out`.
+PRICED = ("in", "out", "cw1h", "cw5m", "cr")
+
+
+def fill_unpriced(entry, table):
+    # type: (dict, object) -> Optional[dict]
+    """The entry with rows recorded before their model had a rate priced, or
+    None when it has none that the table can price now.
+
+    Such a row was never priced at zero by mistake -- its commit reported the
+    model as unpriced -- but once the rate exists, zero is simply wrong. It is
+    recognised by its money: `compute_cost` priced its web searches and nothing
+    else, so its `usd` is exactly what those cost.
+
+    The ledger keeps no speed, so a row is priced as standard, as `tkus
+    reprice` prices everything. `filled` marks it, and is a constant rather
+    than a time so two people filling the same line write the same bytes.
+    """
+    when = parse_timestamp(entry.get("until") or entry.get("at") or "")
+    if when is None:
+        return None
+    search_rate = table.web_search_per_1k() / 1000.0
+    rows, delta, filled = [], 0.0, 0
+    for row in entry.get("providers") or []:
+        rows.append(row)
+        if (row.get("provider", "claude-code") != "claude-code" or "naiu" in row
+                or not any(row.get(name) for name in PRICED)):
+            continue
+        try:
+            recorded = float(row.get("usd") or 0.0)
+            searches = int(row.get("ws") or 0)
+        except (TypeError, ValueError):
+            continue
+        if abs(recorded - searches * search_rate) > 1e-9:
+            continue
+        cost = compute_cost_from_totals(totals_from_entry({"providers": [row]}),
+                                        table, when)
+        if cost.unpriced_models:
+            continue
+        rows[-1] = dict(row, usd=round(cost.total, 10), filled=True)
+        delta += rows[-1]["usd"] - recorded
+        filled += 1
+    if not filled:
+        return None
+    return dict(entry, providers=rows,
+                usd=round(float(entry.get("usd") or 0.0) + delta, 10))
 
 
 def append(repo_root: str, entry: dict) -> None:
