@@ -105,7 +105,7 @@ def hook_pre_commit(root: str, argv: List[str]) -> int:
             if repoledger.pending_fold(root, rel) and (
                     repoledger.is_tracked(root, rel)
                     or not repoledger.is_ignored(root, rel)):
-                repoledger.write_entry(root, None, rel)
+                _announce_ledger(*repoledger.write_entry(root, None, rel))
         cursor_mod.write_pending(root, window_end)
         return 0
 
@@ -124,9 +124,34 @@ def hook_pre_commit(root: str, argv: List[str]) -> int:
     if repoledger.enabled(table):
         rel = repoledger.relative_path(root)
         if repoledger.is_tracked(root, rel) or not repoledger.is_ignored(root, rel):
-            repoledger.write_entry(root, entry, rel)
+            rel, stale = repoledger.write_entry(root, entry, rel)
+            _announce("staged this commit's AI cost in %s -- written by the tkus "
+                      "hook; nothing to check or commit by hand" % rel)
+            _announce_ledger(rel, stale)
     cursor_mod.write_pending(root, window_end, detail=entry)
     return 0
+
+
+def _announce(message: str) -> None:
+    """One line on the commit's output explaining what the hook staged.
+
+    Without it an agent sees an unexplained `.tkus/...jsonl` in its commit and
+    spends a dozen tool calls inspecting it -- showing the commit, tailing the
+    ledger, even `git mv`-ing it by hand after a branch rename. One line per
+    commit is far cheaper than that investigation. stderr because git passes a
+    hook's stderr through to `git commit`; errors are swallowed because a
+    closed stream must never fail a commit.
+    """
+    try:
+        sys.stderr.write("tkus: %s\n" % message)
+        sys.stderr.flush()
+    except (OSError, ValueError):
+        pass
+
+
+def _announce_ledger(rel: str, stale: List[str]) -> None:
+    for old in stale:
+        _announce("moved %s into %s (branch was renamed)" % (old, rel))
 
 
 def hook_post_commit(root: str, argv: List[str]) -> int:

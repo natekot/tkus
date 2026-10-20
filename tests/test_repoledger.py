@@ -84,10 +84,16 @@ class RepoLedgerTestCase(unittest.TestCase):
             }) + "\n")
 
     def commit(self, message, content=None):
+        """Commit a change to f.txt; returns what the commit wrote to stderr."""
         with open(os.path.join(self.repo, "f.txt"), "a") as fh:
             fh.write(content or (message + "\n"))
         self.git("add", "f.txt")
-        self.git("commit", "-q", "-m", message)
+        out = subprocess.run(["git", "commit", "-q", "-m", message],
+                             cwd=self.repo, env=self.env,
+                             stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        if out.returncode != 0:
+            raise AssertionError("git commit failed: %s" % out.stderr.decode())
+        return out.stderr.decode()
 
     def entries(self, ref="HEAD"):
         """Every ledger entry present in a given tree."""
@@ -124,6 +130,38 @@ class TestCommitMessagesAreUntouched(RepoLedgerTestCase):
         self.inject_usage()
         self.commit("first")
         self.assertEqual(self.git("status", "--porcelain").strip(), "")
+
+
+class TestHookExplainsTheLedger(RepoLedgerTestCase):
+    """An unexplained `.tkus/` file in a commit sends agents off investigating
+    it, so the hook says what it staged -- and stays silent when it staged
+    nothing, since then there is nothing to explain."""
+
+    def test_names_the_staged_ledger(self):
+        self.inject_usage()
+        err = self.commit("first")
+        self.assertIn("tkus: staged this commit's AI cost in .tkus/Tester/main.jsonl",
+                      err)
+        self.assertIn("nothing to check or commit by hand", err)
+
+    def test_silent_without_usage(self):
+        self.assertNotIn("tkus:", self.commit("no agent here"))
+
+    def test_silent_when_the_ledger_is_ignored(self):
+        with open(os.path.join(self.repo, ".gitignore"), "w") as fh:
+            fh.write(".tkus/\n")
+        self.inject_usage()
+        self.assertNotIn("tkus:", self.commit("with the ledger ignored"))
+
+    def test_reports_a_rename_fold(self):
+        self.commit("base")
+        self.git("checkout", "-q", "-b", "old")
+        self.inject_usage()
+        self.commit("first")
+        self.git("branch", "-m", "old", "new")
+        err = self.commit("no usage, but the fold still stages a file")
+        self.assertIn("tkus: moved .tkus/Tester/old.jsonl into "
+                      ".tkus/Tester/new.jsonl (branch was renamed)", err)
 
 
 class TestLinkedWorktree(RepoLedgerTestCase):
