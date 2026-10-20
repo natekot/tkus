@@ -30,7 +30,7 @@ import os
 import re
 import subprocess
 from datetime import datetime, timezone
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Tuple
 
 from . import ledger
 
@@ -241,11 +241,12 @@ def read_worktree(repo_root: str, rel_path: Optional[str] = None) -> List[dict]:
 
 
 def write_entry(repo_root, entry, rel_path=None, table=None):
-    # type: (str, Optional[dict], Optional[str], object) -> str
+    # type: (str, Optional[dict], Optional[str], object) -> Tuple[str, List[str]]
     """Rebuild the ledger from HEAD plus this entry, and stage it.
 
     Staging is what puts the file in *this* commit rather than the next one.
     With no entry it only folds in a renamed branch's file (see pending_fold).
+    Returns (path written, pre-rename paths folded into it and removed).
 
     Given the rate table, rows recorded before their model had a rate are
     priced on the way through. That is not optional for `tkus reprice --fill`:
@@ -269,7 +270,7 @@ def write_entry(repo_root, entry, rel_path=None, table=None):
             os.remove(absolute_path(repo_root, old))
         except OSError:
             pass
-    return rel
+    return rel, stale
 
 
 def rewrite(repo_root, rel, entries):

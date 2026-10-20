@@ -161,6 +161,8 @@ def _file_tags(root, table, since, records):
         repoledger.write_entry(
             root, _window_entry(root, row["records"], table, row["since"],
                                 row["until"]), rel, table)
+        _announce("staged AI cost tagged %r in %s -- written by the tkus hook; "
+                  "nothing to check or commit by hand" % (row["name"], rel))
     return start, rest, tags
 
 
@@ -179,16 +181,41 @@ def hook_pre_commit(root: str, argv: List[str]) -> int:
         if repoledger.enabled(table):
             rel = repoledger.relative_path(root)
             if repoledger.pending_fold(root, rel) and _files_to_repo(root, table, rel):
-                repoledger.write_entry(root, None, rel, table)
+                _announce_ledger(*repoledger.write_entry(root, None, rel, table))
         cursor_mod.write_pending(root, window_end, tags=tags)
         return 0
 
     entry = _window_entry(root, records, table, since, window_end)
     rel = repoledger.relative_path(root)
     if _files_to_repo(root, table, rel):
-        repoledger.write_entry(root, entry, rel, table)
+        rel, stale = repoledger.write_entry(root, entry, rel, table)
+        _announce("staged this commit's AI cost in %s -- written by the tkus "
+                  "hook; nothing to check or commit by hand" % rel)
+        _announce_ledger(rel, stale)
     cursor_mod.write_pending(root, window_end, detail=entry, tags=tags)
     return 0
+
+
+def _announce(message: str) -> None:
+    """One line on the commit's output explaining what the hook staged.
+
+    Without it an agent sees an unexplained `.tkus/...jsonl` in its commit and
+    spends a dozen tool calls inspecting it -- showing the commit, tailing the
+    ledger, even `git mv`-ing it by hand after a branch rename. One line per
+    commit is far cheaper than that investigation. stderr because git passes a
+    hook's stderr through to `git commit`; errors are swallowed because a
+    closed stream must never fail a commit.
+    """
+    try:
+        sys.stderr.write("tkus: %s\n" % message)
+        sys.stderr.flush()
+    except (OSError, ValueError):
+        pass
+
+
+def _announce_ledger(rel: str, stale: List[str]) -> None:
+    for old in stale:
+        _announce("moved %s into %s (branch was renamed)" % (old, rel))
 
 
 def hook_post_commit(root: str, argv: List[str]) -> int:

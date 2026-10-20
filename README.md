@@ -131,6 +131,11 @@ Two hooks are written:
 | `pre-commit` | Computes usage since the last commit, writes and stages the ledger |
 | `post-commit` | Advances the watermark once the commit exists |
 
+**The ledger file explains itself.** Whenever `pre-commit` stages a ledger it
+prints one line to the commit's output, naming the file and saying nothing needs
+doing by hand. Without it, coding agents seeing an unexpected `.tkus/` file in
+their commit spend tokens investigating it.
+
 **Existing hooks are never clobbered.** A hook of the same name is renamed to
 `<name>.local` and still runs first; if it fails, the commit aborts exactly as
 before.

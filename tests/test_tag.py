@@ -111,6 +111,15 @@ class TestOutput(TagHarness):
         out = self.tag("strategy")
         self.assertRegex(out, r"\(\d{4}-\d\d-\d\d \d\d:\d\d -> \d\d:\d\d UTC\)")
 
+    def test_the_commit_that_files_it_says_so(self):
+        """Like the branch ledger, a tag file staged into a commit is named
+        on the commit's output, so nobody investigates it."""
+        self.inject_usage(2000)
+        self.tag("strategy")
+        err = self.commit("work")
+        [tagged] = self.tag_files("strategy/")
+        self.assertIn("tkus: staged AI cost tagged 'strategy' in %s" % tagged, err)
+
 
 class TestReusedNames(TagHarness):
     def test_one_name_on_two_branches_merges_without_conflict(self):
