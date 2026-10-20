@@ -728,9 +728,8 @@ def cmd_rename(args) -> int:
     or in another clone, leaves nothing to find -- so this records the old name
     and the next commit folds it the same way.
 
-    It records rather than moves because pre-commit rebuilds the ledger from
-    HEAD: a moved-and-staged file would be overwritten by the next commit,
-    while the staged removal of the old one still landed.
+    It records rather than moves because the target need not be checked out:
+    the move has to land in that branch's next commit, whenever that is.
     """
     root = repo_root()
     if not args.old:

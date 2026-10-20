@@ -244,6 +244,53 @@ class TestSquash(RepoLedgerTestCase):
         self.assertNotIn("AI-Cost", self.git("log", "-1", "--format=%B"))
         self.assertTrue(self.entries())
 
+    def squash_locally(self):
+        """Three commits on a branch, squashed by `reset --soft` to the base
+        and recommitted with new usage. Returns the pre-squash total."""
+        self.commit("base")
+        self.git("checkout", "-q", "-b", "feature")
+        for tokens in (1000, 2000, 3000):
+            self.inject_usage(tokens)
+            self.commit("work %d" % tokens)
+        total = sum(e["usd"] for e in self.entries())
+        self.git("reset", "-q", "--soft", "main")
+        self.inject_usage(500)
+        self.git("commit", "-q", "-m", "squashed")
+        return total
+
+    def test_entries_survive_a_local_soft_reset_squash(self):
+        """HEAD is the base, which has no ledger: the entries are only in the
+        index. Rebuilding from HEAD alone used to discard all three."""
+        before = self.squash_locally()
+        entries = self.entries()
+        self.assertEqual(len(entries), 4)
+        self.assertAlmostEqual(sum(e["usd"] for e in entries[:3]), before, places=9)
+
+    def test_log_credits_a_local_squash_to_the_squash_commit(self):
+        self.squash_locally()
+        out = subprocess.run([sys.executable, "-m", "tkus", "log", "--json"],
+                             cwd=self.repo, env=self.env, stdout=subprocess.PIPE,
+                             check=True)
+        data = json.loads(out.stdout.decode())
+        self.assertEqual(data["orphaned"], [])
+        self.assertEqual([c["subject"] for c in data["commits"]], ["squashed"])
+        self.assertAlmostEqual(data["total"], sum(e["usd"] for e in self.entries()),
+                               places=9)
+
+    def test_undo_and_recommit_keeps_the_entry(self):
+        """`reset --soft HEAD~1` then commit again: the entry is only in the
+        index, and its parent is HEAD -- so neither may be the signal."""
+        self.commit("base")
+        self.inject_usage(4000)
+        self.commit("oops")
+        before = self.entries()
+        self.git("reset", "-q", "--soft", "HEAD~1")
+        self.inject_usage(1000)
+        self.git("commit", "-q", "-m", "fixed")
+        entries = self.entries()
+        self.assertEqual(len(entries), 2)
+        self.assertEqual(entries[:1], before)
+
 
 class TestAbandonedCommit(RepoLedgerTestCase):
     def test_abandoned_commit_does_not_double_count(self):
@@ -270,6 +317,29 @@ class TestAbandonedCommit(RepoLedgerTestCase):
         self.env["GIT_EDITOR"] = "false"
         self.git("commit", check=False)
         self.assertIsNone(cursor.cursor_since(self.repo))
+
+    def test_abandoned_then_soft_reset_does_not_double_count(self):
+        """The abandoned entry's parent no longer matches HEAD, but its usage
+        is still in the next window -- so it must still be dropped."""
+        self.inject_usage(1000)
+        self.commit("base")
+        self.inject_usage(2000)
+        self.commit("second")
+        committed = self.entries()
+
+        self.inject_usage(5000)
+        with open(os.path.join(self.repo, "f.txt"), "a") as fh:
+            fh.write("x")
+        self.git("add", "f.txt")
+        self.env["GIT_EDITOR"] = "false"
+        self.git("commit", check=False)
+        self.env["GIT_EDITOR"] = "true"
+
+        self.git("reset", "-q", "--soft", "HEAD~1")
+        self.git("commit", "-q", "-m", "for real this time")
+        entries = self.entries()
+        self.assertEqual(len(entries), 3)
+        self.assertEqual(entries[:2], committed)
 
 
 class TestAmend(RepoLedgerTestCase):

@@ -203,7 +203,9 @@ cost, rate-table version, and the parent commit SHA.
 > want, `tkus install --local-only` keeps it in `.git/` instead.
 
 The file is rebuilt from `HEAD` on each commit rather than appended to, so a
-commit you abandon in the editor leaves nothing behind to double-count.
+commit you abandon in the editor leaves nothing behind to double-count. Entries
+that only the index holds are kept, so a squash with `git reset --soft` keeps
+the entries of the commits it folds.
 
 Add this to `.gitattributes` to keep it out of review diffs:
 
@@ -351,7 +353,9 @@ finish a pending branch rename.
 
 **Amend, squash, rebase** all work without special handling. An amended commit
 keeps its entry — the entry is already in the index — and adds only new usage. A
-squash merges entries like any file.
+squash merges entries like any file, and so does a local one made with `git
+reset --soft`: the index still holds the folded commits' entries, and they are
+kept.
 
 **Renaming a branch** carries its ledger along: the first commit after `git
 branch -m old new` moves the entries in `old.jsonl` into `new.jsonl` and removes
@@ -371,7 +375,7 @@ that branch's. The move lands in your next commit, even one with no AI usage;
 until then `tkus log` and `rollup` still show the split.
 
 **Abandoning a commit** in the editor leaves nothing behind: the next commit
-rebuilds the ledger from `HEAD`.
+drops the staged entry it left and records that usage itself.
 
 **`--no-verify` skips `pre-commit`**, so nothing is recorded for that commit.
 

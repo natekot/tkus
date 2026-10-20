@@ -17,10 +17,11 @@ occurrence for the same reason:
 
     .tkus/<identity>/.tags/<name>/<until>.jsonl
 
-The file is **rebuilt from HEAD** on every commit rather than appended to. That
-makes an abandoned commit self-correcting: its entry was staged but never
-committed, so it is absent from HEAD and the next commit simply overwrites it.
-No de-duplication rule, and no way for an abandoned commit to double-count.
+The file is **rebuilt from HEAD** on every commit rather than appended to, plus
+whatever the index holds that HEAD does not -- which is how a `reset --soft`
+squash keeps the entries of the commits it folded. The one staged entry left
+out is an abandoned commit's: post-commit never ran for it, so it is still
+pending, and the next commit re-collects its usage and overwrites it.
 """
 
 from __future__ import annotations
@@ -32,7 +33,7 @@ import subprocess
 from datetime import datetime, timezone
 from typing import Dict, List, Optional, Tuple
 
-from . import ledger
+from . import cursor, ledger
 
 LEDGER_DIR = ".tkus"
 
@@ -231,6 +232,27 @@ def read_committed(repo_root: str, rel_path: Optional[str] = None) -> List[dict]
     return _parse(text) if text else []
 
 
+def read_staged(repo_root: str, rel_path: Optional[str] = None) -> List[dict]:
+    """Entries as the index holds them -- what this commit would record."""
+    rel = rel_path or relative_path(repo_root)
+    text = _git(repo_root, ["show", ":%s" % rel])
+    return _parse(text) if text else []
+
+
+def _unfinished(repo_root, entry):
+    # type: (str, Optional[dict]) -> set
+    """Keys of staged entries whose usage this commit is about to re-collect.
+
+    That is the entry a commit abandoned in the editor left staged -- post-commit
+    never ran, so it is still pending -- and any entry about to be written
+    again under the same key, as a tag re-filed after an abandoned attempt is.
+    """
+    keys = {entry_key((cursor.read_pending(repo_root) or {}).get("detail") or {})}
+    if entry is not None:
+        keys.add(entry_key(entry))
+    return keys - {None}
+
+
 def read_worktree(repo_root: str, rel_path: Optional[str] = None) -> List[dict]:
     path = absolute_path(repo_root, rel_path)
     try:
@@ -248,6 +270,11 @@ def write_entry(repo_root, entry, rel_path=None, table=None):
     With no entry it only folds in a renamed branch's file (see pending_fold).
     Returns (path written, pre-rename paths folded into it and removed).
 
+    Entries only the index holds are kept too, bar an unfinished commit's.
+    `git reset --soft` moves HEAD and leaves the index alone, so after a local
+    squash or an undone commit the entries already committed are staged but no
+    longer in HEAD -- and rebuilding from HEAD alone would discard them.
+
     Given the rate table, rows recorded before their model had a rate are
     priced on the way through. That is not optional for `tkus reprice --fill`:
     HEAD still holds them unpriced, so a rebuild without it would quietly undo
@@ -256,6 +283,9 @@ def write_entry(repo_root, entry, rel_path=None, table=None):
     rel = rel_path or relative_path(repo_root)
     folded, stale = _renamed_entries(repo_root, rel)
     entries = _merge(folded, read_committed(repo_root, rel))
+    drop = _unfinished(repo_root, entry)
+    entries = _merge(entries, [e for e in read_staged(repo_root, rel)
+                               if entry_key(e) not in drop])
     if table is not None:
         entries = [ledger.fill_unpriced(e, table) or e for e in entries]
     if entry is not None:
