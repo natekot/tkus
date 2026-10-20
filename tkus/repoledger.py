@@ -26,6 +26,7 @@ pending, and the next commit re-collects its usage and overwrites it.
 
 from __future__ import annotations
 
+import contextlib
 import json
 import os
 import re
@@ -47,8 +48,38 @@ TAGS_DIR = ".tags"
 _UNSAFE = re.compile(r'[<>:"\\|?*\x00-\x1f]')
 
 
+# Answers to git queries a hook makes, while it runs; None outside one. A single
+# commit asks for the identity, the branch and its former names several times
+# over, each ask is a process spawn -- slow on Windows -- and nothing a hook
+# does can change the answer. Index and tree queries are never kept: the hook
+# stages files, which changes those.
+_READS = None  # type: Optional[Dict[tuple, Optional[str]]]
+_STABLE = ("config", "symbolic-ref", "reflog", "rev-parse")
+
+
+@contextlib.contextmanager
+def cached_reads():
+    global _READS
+    _READS = {}
+    try:
+        yield
+    finally:
+        _READS = None
+
+
 def _git(repo_root, args, check=False):
     # type: (str, List[str], bool) -> Optional[str]
+    key = (repo_root, tuple(args))
+    if _READS is not None and key in _READS:
+        return _READS[key]
+    result = _run_git(repo_root, args)
+    if _READS is not None and args[0] in _STABLE and "--add" not in args:
+        _READS[key] = result
+    return result
+
+
+def _run_git(repo_root, args):
+    # type: (str, List[str]) -> Optional[str]
     try:
         out = subprocess.run(["git"] + args, cwd=repo_root, stdout=subprocess.PIPE,
                              stderr=subprocess.DEVNULL, timeout=10)
@@ -71,10 +102,16 @@ def identity(repo_root: str) -> str:
     `user.email` is deliberately not used: it would publish email addresses in
     repository paths.
     """
+    # Both keys in one spawn. git prints names lowercased, and a key set more
+    # than once prints every value, the last winning, as `--get` would pick.
+    text = _git(repo_root, ["config", "--get-regexp", r"^(tkus\.identity|user\.name)$"])
+    values = {}
+    for line in (text or "").splitlines():
+        key, _, value = line.partition(" ")
+        values[key] = value.strip()
     for key in ("tkus.identity", "user.name"):
-        value = _git(repo_root, ["config", "--get", key])
-        if value and value.strip():
-            return _sanitize(value.strip().replace(os.sep, "-").replace("/", "-"),
+        if values.get(key):
+            return _sanitize(values[key].replace(os.sep, "-").replace("/", "-"),
                              "unknown")
     return "unknown"
 
@@ -86,10 +123,12 @@ def branch_name(repo_root: str) -> str:
     string "HEAD" (and prints a fatal) before the first commit exists. A detached
     HEAD has no branch, so entries are filed under "detached".
     """
-    value = _git(repo_root, ["symbolic-ref", "--short", "HEAD"])
-    if not value or not value.strip():
+    # The full ref rather than `--short`, so it is the same query (and, in a
+    # hook, the same cached answer) as renamed_from's.
+    value = (_git(repo_root, ["symbolic-ref", "HEAD"]) or "").strip()
+    if not value.startswith("refs/heads/"):
         return "detached"
-    return _branch_path(value.strip())
+    return _branch_path(value[len("refs/heads/"):])
 
 
 def _branch_path(name: str) -> str:

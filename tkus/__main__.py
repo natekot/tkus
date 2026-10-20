@@ -30,15 +30,19 @@ from .providers.base import (aggregate_by_model, collect_all, format_timestamp,
 
 
 def repo_root(start: Optional[str] = None) -> str:
+    # The git dir comes along in the same call: nearly every command needs it
+    # next, and a second spawn costs as much as the first.
     try:
         out = subprocess.check_output(
-            ["git", "rev-parse", "--show-toplevel"],
+            ["git", "rev-parse", "--show-toplevel", "--absolute-git-dir"],
             cwd=start or os.getcwd(),
             stderr=subprocess.DEVNULL,
         )
     except (subprocess.CalledProcessError, OSError):
         sys.exit("tkus: not inside a git repository")
-    return out.decode().strip()
+    root, git_dir = out.decode().strip().splitlines()
+    cursor_mod.remember_git_dir(root, git_dir.strip())
+    return root
 
 
 def _repo_root_or_none() -> Optional[str]:
@@ -923,7 +927,8 @@ def cmd_hook(args) -> int:
     if handler is None:
         return 0
     try:
-        return handler(repo_root(), args.args)
+        with repoledger.cached_reads():
+            return handler(repo_root(), args.args)
     except Exception as exc:  # noqa: BLE001
         # Recording cost must never block a commit.
         sys.stderr.write("tkus: %s hook failed: %s\n" % (args.name, exc))

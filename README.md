@@ -831,8 +831,13 @@ Ledger entries already committed are ordinary files and stay in history.
 ```sh
 git clone https://github.com/natekot/tkus.git
 cd tkus
-python3 -m unittest discover -s tests -t .      # 347 tests
+python3 -m tests                                # 356 tests, one worker per CPU
 ```
+
+`python3 -m tests -j N tests.test_log` limits workers and selects tests by id
+prefix. `python3 -m unittest discover -s tests -t .` runs the same suite
+serially. Most of its time is process spawns -- every real commit runs git,
+sh and two Python hooks -- which is why it is worth running in parallel.
 
 The suite includes regressions pinned to redacted snapshots of real agent data
 for both providers, and exercises squash, amend, abandonment, and branch

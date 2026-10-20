@@ -15,7 +15,7 @@ import json
 import os
 import subprocess
 from datetime import datetime
-from typing import List, Optional
+from typing import Dict, List, Optional
 
 from .providers.base import format_timestamp, parse_timestamp
 
@@ -25,16 +25,27 @@ PENDING_FILE = "pending.json"
 TAGS_FILE = "tags.json"
 
 
+# Cached because one hook asks several times, and every ask is a process
+# spawn -- expensive on Windows. A repository's git dir never moves.
+_GIT_DIRS = {}  # type: Dict[str, str]
+
+
+def remember_git_dir(repo_root: str, path: str) -> None:
+    _GIT_DIRS[repo_root] = path
+
+
 def git_dir(repo_root: str) -> str:
     """Resolve the git directory.
 
     Uses rev-parse rather than assuming `<root>/.git`, because in a worktree
     `.git` is a file pointing elsewhere.
     """
-    out = subprocess.check_output(
-        ["git", "rev-parse", "--absolute-git-dir"], cwd=repo_root
-    )
-    return out.decode().strip()
+    if repo_root not in _GIT_DIRS:
+        out = subprocess.check_output(
+            ["git", "rev-parse", "--absolute-git-dir"], cwd=repo_root
+        )
+        _GIT_DIRS[repo_root] = out.decode().strip()
+    return _GIT_DIRS[repo_root]
 
 
 def state_dir(repo_root: str, create: bool = True) -> str:

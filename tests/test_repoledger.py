@@ -8,6 +8,7 @@ verified by actually running git, not by reasoning about it.
 
 from __future__ import annotations
 
+import atexit
 import json
 import os
 import shutil
@@ -22,6 +23,9 @@ from tkus.pricing import RateTable
 
 PROJECT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
+# Built on first use by RepoLedgerTestCase._template.
+_TEMPLATE = None
+
 
 class RepoLedgerTestCase(unittest.TestCase):
     """A real repo with tkus hooks installed and a synthetic Claude transcript."""
@@ -29,7 +33,6 @@ class RepoLedgerTestCase(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.mkdtemp()
         self.repo = os.path.join(self.tmp, "repo")
-        os.makedirs(self.repo)
         self.projects = os.path.join(self.tmp, "projects")
         os.makedirs(self.projects)
         self.counter = 0
@@ -43,11 +46,25 @@ class RepoLedgerTestCase(unittest.TestCase):
             "GIT_AUTHOR_NAME": "Tester", "GIT_COMMITTER_NAME": "Tester",
             "GIT_AUTHOR_EMAIL": "t@e.st", "GIT_COMMITTER_EMAIL": "t@e.st",
         })
-        self.git("init", "-q", "-b", "main")
-        self.git("config", "user.name", "Tester")
-        self.git("config", "user.email", "t@e.st")
-        subprocess.run([sys.executable, "-m", "tkus", "install"], cwd=self.repo,
-                       env=self.env, stdout=subprocess.DEVNULL, check=True)
+        # An installed repo is identical every time, so it is built once per
+        # process and copied: building it costs four process spawns.
+        shutil.copytree(self._template(), self.repo, symlinks=True)
+
+    def _template(self):
+        global _TEMPLATE
+        if _TEMPLATE is None:
+            template = os.path.join(tempfile.mkdtemp(), "repo")
+            os.makedirs(template)
+            self.git("init", "-q", "-b", "main", cwd=template)
+            self.git("config", "user.name", "Tester", cwd=template)
+            self.git("config", "user.email", "t@e.st", cwd=template)
+            # Otherwise every commit spawns `git maintenance run --auto`.
+            self.git("config", "maintenance.auto", "false", cwd=template)
+            subprocess.run([sys.executable, "-m", "tkus", "install"], cwd=template,
+                           env=self.env, stdout=subprocess.DEVNULL, check=True)
+            atexit.register(shutil.rmtree, os.path.dirname(template), True)
+            _TEMPLATE = template
+        return _TEMPLATE
 
     def tearDown(self):
         shutil.rmtree(self.tmp, ignore_errors=True)
