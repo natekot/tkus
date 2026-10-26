@@ -80,6 +80,10 @@
     "claude-sonnet-4-6": {
       "standard": [{"from": null, "until": null, "input": 3.0, "output": 15.0}]
     },
+    "claude-haiku-5-5": {
+      "standard": [{"from": null, "until": null, "input": 0.1, "output": 0.5,
+                    "long_context": {"above": 100000, "input": 0.5, "output": 2.5}}]
+    },
     "claude-haiku-4-5": {
       "standard": [{"from": null, "until": null, "input": 1.0, "output": 5.0}]
     },

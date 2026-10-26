@@ -166,6 +166,28 @@ class RateTable:
             for name, default in self.CACHE_FIELDS
         )
 
+    def long_context(self, model: str, speed: str, when: datetime):
+        # type: (...) -> Optional[Tuple[int, Tuple[float, float], Tuple[float, float, float]]]
+        """(threshold, (input, output), cache rates) for prompts above a size.
+
+        Most models price the whole context window at one rate. Haiku 5.5 does
+        not: a prompt over 100,000 tokens -- input plus cache reads and writes
+        -- is billed at 5x for every token of that request. Cache prices derive
+        from the long input rate unless the tier names them.
+        """
+        window = self.window_for(model, speed, when)
+        tier = (window or {}).get("long_context")
+        if not tier:
+            return None
+        rate_in = float(tier["input"])
+        explicit = tier.get("cache") or {}
+        cache = tuple(
+            float(explicit[name]) if name in explicit
+            else rate_in * self.multiplier(name, default)
+            for name, default in self.CACHE_FIELDS
+        )
+        return int(tier["above"]), (rate_in, float(tier["output"])), cache
+
     def multiplier(self, name: str, default: float) -> float:
         return float(self.data.get("multipliers", {}).get(name, default))
 
@@ -213,6 +235,13 @@ class Cost:
         )
 
 
+def prompt_tokens(record):
+    # type: (UsageRecord) -> int
+    """The prompt size a long-context threshold is measured against."""
+    return (record.input_tokens + record.cache_read
+            + record.cache_write_1h + record.cache_write_5m)
+
+
 def compute_cost(records, table, when=None):
     # type: (Iterable[UsageRecord], RateTable, Optional[datetime]) -> Cost
     """Price records, bucketing by (model, speed, tier) so mixed modes stay correct.
@@ -244,12 +273,13 @@ def compute_cost(records, table, when=None):
         # cost and are not on an unbilled endpoint. Looking it up regardless
         # would flag a model as "unpriced" even when nothing needed pricing.
         needs_rate = any(r.nano_aiu is None and not r.unbilled for r in group)
-        rate = cache = None
+        rate = cache = long = None
         if needs_rate:
             # Price each bucket at the rates in effect for its own window.
             stamp = when or max(r.timestamp for r in group)
             rate = table.rate_for(model, speed, stamp)
             cache = table.cache_rates(model, speed, stamp)
+            long = table.long_context(model, speed, stamp)
             if rate is None:
                 # Never price an unknown model as zero -- that silently undercounts.
                 unpriced.add(model)
@@ -267,6 +297,8 @@ def compute_cost(records, table, when=None):
             elif rate is not None:
                 rate_in, rate_out = rate
                 cw1h, cw5m, cread = cache
+                if long is not None and prompt_tokens(r) > long[0]:
+                    (rate_in, rate_out), (cw1h, cw5m, cread) = long[1], long[2]
                 subtotal += (
                     r.input_tokens * rate_in
                     + r.output_tokens * rate_out
@@ -295,6 +327,8 @@ def compute_cost_from_totals(totals_by_model, table, when):
     original records are gone and only trailer token counts survive. Those
     counts carry no speed or tier, so everything is priced as standard --
     a fast-mode request folded into a squash is priced at standard rates.
+    Nor do they carry per-request prompt sizes, so a long-context tier is
+    never applied here: those requests re-price at the base rate.
     """
     cost = Cost(
         currency=table.currency,

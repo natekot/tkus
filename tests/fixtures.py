@@ -67,6 +67,18 @@ def write_project(root: str, encoded_name: str, lines: List[str]) -> str:
     return path
 
 
+def write_subagent(root: str, encoded_name: str, lines: List[str],
+                   session: str = "session", agent: str = "agent-a") -> str:
+    """Create <root>/<encoded_name>/<session>/subagents/<agent>.jsonl, where
+    Claude Code keeps a subagent's own transcript."""
+    directory = os.path.join(root, encoded_name, session, "subagents")
+    os.makedirs(directory, exist_ok=True)
+    path = os.path.join(directory, agent + ".jsonl")
+    with open(path, "w") as fh:
+        fh.write("\n".join(lines) + "\n")
+    return path
+
+
 def encode(path: str) -> str:
     return path.replace(os.sep, "-")
 

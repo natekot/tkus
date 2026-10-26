@@ -402,6 +402,8 @@ transcript store.
 | `tkus rates [--at DATE] [--json]` | The rate table used for pricing |
 | `tkus rates --check` | Compare against the installed Claude Code; exit 1 on drift |
 | `tkus rates --update [--yes]` | Write refreshed rates to the global override |
+| `tkus audit [--billed USD] [--month M] [--tz ZONE] [--json]` | This month's Claude Code usage, in every project, against your bill; exit 1 on a mismatch |
+| `tkus telemetry [setup [--yes] \| status \| serve]` | Receive Claude Code's telemetry so `audit` sees requests transcripts miss |
 
 ### What a branch cost, commit by commit
 
@@ -713,6 +715,20 @@ The figure is designed to be reconcilable against a real invoice.
 - **Unknown models are flagged, never priced at zero.** Their rows are filled
   in once a rate exists — see [Filling in a model priced
   late](#filling-in-a-model-priced-late).
+- **Subagent usage is counted.** Each subagent writes its own transcript under
+  `<session>/subagents/`, and its requests do not appear in the session's own
+  file. Before 2026-10 these files were not read, and on real data they held
+  about 30% of the cost. Ledger entries recorded before then are low by that
+  share. They are not rewritten.
+- **Each request is counted with its final usage.** A response is written as
+  several lines, and the lines written while it streams carry partial counts.
+  Before 2026-10 the first line was used, which on real data undercounted
+  output tokens by 28%, or about 6% of cost. A request is now dated by its first
+  line and counted once, with its most complete line.
+- **Haiku 5.5's long-context price is applied.** A Haiku 5.5 prompt over
+  100,000 tokens is billed at 5× for the whole request. The prompt size counts
+  input, cache reads and cache writes. `tkus reprice` cannot apply this tier,
+  because ledger totals do not keep per-request prompt sizes.
 
 ### GitHub Copilot
 
@@ -735,6 +751,108 @@ notional — what the same tokens would cost at the configured rates.
 Because the ledger stores raw token counts rather than only a figure, history
 stays re-priceable: `tkus reprice` recomputes past entries under the current
 table.
+
+### Checking against your bill
+
+`tkus audit` prices every Claude Code request this calendar month, in every
+project, including those without tkus installed. It then compares the
+total with the month-to-date spend you give it. That spend is the usage-credits
+row of `/usage` in Claude Code, which comes from Anthropic's billing rather than
+from a local estimate.
+
+```
+tkus audit --billed 412.80          # or omit --billed to be prompted
+tkus audit --month 2026-09 --billed 1210.55 --json
+```
+
+The command exits 1 when the two differ by more than `--tolerance` percent of
+the billed amount (default 5). Each run is appended to
+`~/.config/tkus/audit.jsonl`, so the history shows when they started to diverge.
+It makes no network calls, apart from checking whether the local telemetry
+receiver is running.
+
+The month runs in UTC unless you set the billing time zone. `/usage` names it,
+for example "Resets Nov 1 (America/Denver)". Set it once in
+`~/.config/tkus/config.json`:
+
+```json
+{"billing": {"timezone": "America/Denver"}}
+```
+
+You can also pass it per run with `--tz`. On Windows, Python needs
+`pip install tzdata` for named time zones.
+
+Reading a difference:
+
+- **The estimate is consistently higher by a fixed ratio.** You probably have a
+  negotiated discount. Set it as a [rate override](#configuration).
+- **The estimate is higher, and the difference grows with usage.** A model is
+  probably priced wrong. Run `tkus rates --check`.
+- **The billed amount is higher.** Claude.ai chat on the same seat is billed but
+  never reaches a transcript. A model may also be unpriced (the report names it),
+  or early transcripts may have been deleted. Claude Code removes them after
+  `cleanupPeriodDays` (default 30), and the audit warns when the month reaches
+  back that far.
+- **Small differences are expected.** `/usage` can lag by up to an hour.
+
+#### Requests the transcripts never record
+
+Some requests Claude Code makes never reach a transcript:
+
+- compaction;
+- the requests behind WebFetch and WebSearch;
+- small helper calls.
+
+On real data they came to 3–5% of cost, and up to 19% in some sessions. Claude
+Code's own telemetry (OpenTelemetry) reports every request, so tkus can receive
+it locally:
+
+```
+tkus telemetry setup          # shows what it will change
+tkus telemetry setup --yes    # applies it
+tkus telemetry status
+```
+
+`setup` does three things:
+
+- adds four `OTEL_*` / `CLAUDE_CODE_ENABLE_TELEMETRY` variables to the `env`
+  block of `~/.claude/settings.json`. It refuses if telemetry already goes
+  somewhere else, such as an organization collector;
+- registers a receiver on `127.0.0.1:4318` that starts at logon;
+- starts the receiver.
+
+Only Claude Code sessions started afterwards send telemetry.
+
+The receiver keeps model, token counts, Claude Code's price, request and
+session ids, and which subsystem made the call (`query_source`, e.g. `compact`).
+Each event also carries your email and account ids; those are dropped. Events
+are kept in `~/.config/tkus/telemetry/`.
+
+With telemetry present, `tkus audit` adds:
+
+- **hidden calls:** requests in telemetry but in no transcript, listed by
+  `query_source` and model and priced as Claude Code priced them. They are
+  added to the estimate.
+- **not in telemetry:** transcript requests from sessions that were not
+  sending telemetry, which is expected for sessions started before setup.
+- **token mismatches:** requests whose counts differ between the two sources.
+  Any count above zero means tkus is reading transcripts wrongly.
+- **since the last audit:** the change in the billed amount since your previous
+  audit this month, next to the transcripts and telemetry over the same
+  interval. This is the fair test, because telemetry starts mid-month. It is
+  shown only when the receiver ran throughout the interval.
+
+The receiver is used only by `audit`. Commit recording never depends on it, so
+the commit hooks still run with no daemon.
+
+To be reminded weekly on Windows, create a scheduled task that opens a prompt:
+
+```
+schtasks /create /tn tkus-audit /sc weekly /d MON /st 10:00 /tr "cmd /k tkus audit"
+```
+
+On macOS or Linux, a cron entry running `tkus audit --billed …` from a script
+works the same way.
 
 ---
 
@@ -772,7 +890,7 @@ per-developer spend visible to everyone with repository access.
 | Copilot usage missing | Needs a CLI version that writes `assistant_usage_events`, and an `origin` remote matching the recorded repository |
 | `N models unpriced` | A model has no rate entry; add one via config |
 | A model shows zero cost | Correct for a self-hosted endpoint — it is not billed |
-| Costs don't match my invoice | You are likely not on list price; configure an override |
+| Costs don't match my invoice | Run `tkus audit` — see [Checking against your bill](#checking-against-your-bill) |
 | Still committed after adding to `.gitignore` | The file is already tracked; run `git rm -r --cached .tkus` |
 
 ---

@@ -1,6 +1,7 @@
 """Claude Code adapter.
 
-Reads ~/.claude/projects/<encoded-cwd>/*.jsonl. Only usage/model/timestamp/cwd
+Reads ~/.claude/projects/<encoded-cwd>/*.jsonl, plus the subagent transcripts
+beside them at <session>/subagents/*.jsonl. Only usage/model/timestamp/cwd
 fields are read -- never prompt or response text, which also lives in these
 files and must not reach a commit message.
 """
@@ -11,7 +12,7 @@ import glob
 import json
 import os
 from datetime import datetime
-from typing import Iterator, List, Optional
+from typing import Dict, Iterable, Iterator, List, Optional, Tuple
 
 from .. import paths
 from .base import Provider, UsageRecord, parse_timestamp, register
@@ -68,11 +69,32 @@ def candidate_dirs(repo_root: str) -> List[str]:
     # Encoding is not fully reversible for unusual path characters. If the
     # prefix guess finds nothing, fall back to scanning every project directory
     # and let the per-record cwd check decide. Correctness over speed here.
+    return all_dirs()
+
+
+def all_dirs() -> List[str]:
+    """Every project directory, for usage not scoped to one repository."""
+    root = projects_root()
+    if not os.path.isdir(root):
+        return []
     return sorted(
         os.path.join(root, name)
         for name in os.listdir(root)
         if os.path.isdir(os.path.join(root, name))
     )
+
+
+def transcript_files(directory: str):
+    # type: (str) -> Tuple[List[str], List[str]]
+    """(session files, subagent files) in one project directory.
+
+    Subagents write their own transcript under the session that started them,
+    and their requests are not repeated in the session file -- skipping them
+    drops all subagent usage.
+    """
+    sessions = sorted(glob.glob(os.path.join(directory, "*.jsonl")))
+    subagents = sorted(glob.glob(os.path.join(directory, "*", "subagents", "*.jsonl")))
+    return sessions, subagents
 
 
 def _iter_records(path: str) -> Iterator[dict]:
@@ -90,42 +112,96 @@ def _iter_records(path: str) -> Iterator[dict]:
         return
 
 
+
+def complete_requests(lines):
+    # type: (Iterable[Tuple[UsageRecord, bool]]) -> List[Tuple[UsageRecord, bool]]
+    """One (record, is_subagent) per request, from its lines in reading order.
+
+    A request is written as one line per content block, and the lines written
+    while it streams carry partial usage -- on real data the first line held
+    28% fewer output tokens than the last. So each request is dated by its
+    first line but counted with its most complete one; ties go to the later
+    line. It belongs to the file kind of its first line.
+    """
+    requests = {}  # type: Dict[str, Tuple[UsageRecord, bool]]
+    for record, is_subagent in lines:
+        known = requests.get(record.request_id)
+        if known is None:
+            requests[record.request_id] = (record, is_subagent)
+            continue
+        first, first_kind = known
+        if record.output_tokens >= first.output_tokens:
+            record.timestamp = min(record.timestamp, first.timestamp)
+            requests[record.request_id] = (record, first_kind)
+        elif record.timestamp < first.timestamp:
+            first.timestamp = record.timestamp
+    return list(requests.values())
+
+
+def split_window(requests, since, until):
+    # type: (Iterable[Tuple[UsageRecord, bool]], Optional[datetime], datetime) -> Tuple[List[UsageRecord], List[UsageRecord]]
+    """(session records, subagent records) dated in (since, until]. Windowing
+    after `complete_requests` is what counts a request spanning a commit once."""
+    sessions = []  # type: List[UsageRecord]
+    subagents = []  # type: List[UsageRecord]
+    for record, is_subagent in requests:
+        if since is not None and record.timestamp <= since:
+            continue
+        if record.timestamp > until:
+            continue
+        (subagents if is_subagent else sessions).append(record)
+    return sessions, subagents
+
+
 class ClaudeCodeProvider(Provider):
     name = "claude-code"
 
     def collect(self, repo_root, since, until):
         # type: (str, Optional[datetime], datetime) -> List[UsageRecord]
-        seen = set()
-        out = []  # type: List[UsageRecord]
+        sessions, subagents = self.collect_split(repo_root, since, until)
+        return sessions + subagents
 
-        for directory in candidate_dirs(repo_root):
-            for path in sorted(glob.glob(os.path.join(directory, "*.jsonl"))):
+    def collect_split(self, repo_root, since, until):
+        # type: (Optional[str], Optional[datetime], datetime) -> Tuple[List[UsageRecord], List[UsageRecord]]
+        """(session records, subagent records).
+
+        A `repo_root` of None collects every project with no cwd check -- the
+        whole account, which is what a bill covers.
+        """
+        directories = all_dirs() if repo_root is None else candidate_dirs(repo_root)
+        lines = []  # type: List[Tuple[UsageRecord, bool]]
+        for directory in directories:
+            for path, is_subagent in self.files(directory):
                 for obj in _iter_records(path):
-                    record = self._to_record(obj, repo_root, since, until, seen)
+                    record = self._to_record(obj, repo_root)
                     if record is not None:
-                        out.append(record)
-        return out
+                        lines.append((record, is_subagent))
+        return split_window(complete_requests(lines), since, until)
 
-    def _to_record(self, obj, repo_root, since, until, seen):
+    @staticmethod
+    def files(directory):
+        # type: (str) -> List[Tuple[str, bool]]
+        """(path, is_subagent) for every transcript in a project directory, in
+        the order they are read."""
+        sessions, subagents = transcript_files(directory)
+        return [(p, False) for p in sessions] + [(p, True) for p in subagents]
+
+    def _to_record(self, obj, repo_root):
+        # type: (dict, Optional[str]) -> Optional[UsageRecord]
         if obj.get("type") != "assistant":
             return None
 
-        # Usage is repeated across every line sharing a requestId (one line per
-        # content block). Counting them all roughly doubles the total.
         request_id = obj.get("requestId")
-        if not request_id or request_id in seen:
+        if not request_id:
             return None
 
-        cwd = obj.get("cwd")
-        if not cwd or not _is_within(cwd, repo_root):
-            return None
+        if repo_root is not None:
+            cwd = obj.get("cwd")
+            if not cwd or not _is_within(cwd, repo_root):
+                return None
 
         when = parse_timestamp(obj.get("timestamp", ""))
         if when is None:
-            return None
-        if since is not None and when <= since:
-            return None
-        if when > until:
             return None
 
         message = obj.get("message") or {}
@@ -148,7 +224,6 @@ class ClaudeCodeProvider(Provider):
 
         server_tools = usage.get("server_tool_use") or {}
 
-        seen.add(request_id)
         return UsageRecord(
             provider=self.name,
             request_id=request_id,

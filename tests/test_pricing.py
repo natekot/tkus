@@ -400,6 +400,48 @@ class TestBundledOpus55Fast(unittest.TestCase):
             (16.0, 10.0, 0.4))
 
 
+class TestHaiku55LongContext(unittest.TestCase):
+    """Haiku 5.5 bills a prompt over 100,000 tokens at 5x for the whole
+    request, where every other current model prices its full window flat."""
+
+    def setUp(self):
+        self.table = RateTable.load(None)
+
+    def cost(self, **kw):
+        return compute_cost([record(model="claude-haiku-5-5", **kw)], self.table).total
+
+    def test_at_the_threshold_is_base_rate(self):
+        self.assertAlmostEqual(self.cost(input_tokens=100000), 0.01, places=9)
+
+    def test_over_the_threshold_is_long_rate(self):
+        self.assertAlmostEqual(self.cost(input_tokens=100001), 100001 * 0.5 / MTOK,
+                               places=9)
+
+    def test_long_rate_applies_to_output_too(self):
+        self.assertAlmostEqual(
+            self.cost(input_tokens=100001, output_tokens=MTOK),
+            100001 * 0.5 / MTOK + 2.5, places=9)
+
+    def test_cache_reads_count_toward_the_threshold(self):
+        """Agent prompts are mostly cache reads; measuring only uncached input
+        would never cross the threshold."""
+        self.assertAlmostEqual(
+            self.cost(input_tokens=10, cache_read=100000),
+            (10 * 0.5 + 100000 * 0.05) / MTOK, places=9)
+
+    def test_long_cache_prices_derive_from_the_long_input_rate(self):
+        self.assertAlmostEqual(
+            self.cost(cache_write_1h=60000, cache_write_5m=50000),
+            (60000 * 1.0 + 50000 * 0.625) / MTOK, places=9)
+
+    def test_totals_reprice_at_base_rate(self):
+        """Ledger totals carry no per-request prompt size."""
+        totals = {("claude-code", "claude-haiku-5-5"): ModelTotals(
+            model="claude-haiku-5-5", provider="claude-code", input_tokens=200000)}
+        cost = compute_cost_from_totals(totals, self.table, at("2026-10-01"))
+        self.assertAlmostEqual(cost.total, 0.02, places=9)
+
+
 class TestBundledSonnet55(unittest.TestCase):
     """Sonnet 5.5 is on the ordinary multiple: $2/$10, cache reads $0.20."""
 

@@ -922,6 +922,347 @@ def cmd_show(args) -> int:
     return 0
 
 
+AUDIT_HISTORY = "audit.jsonl"
+# Claude Code deletes transcripts older than this unless settings say otherwise.
+DEFAULT_CLEANUP_DAYS = 30
+
+
+def _billing_zone(args, table):
+    """The time zone the bill's month runs in -- `/usage` names it, e.g.
+    "Resets Nov 1 (America/Denver)". UTC unless configured."""
+    name = getattr(args, "tz", None) or (table.data.get("billing") or {}).get("timezone")
+    if not name:
+        return timezone.utc
+    try:
+        from zoneinfo import ZoneInfo
+        return ZoneInfo(name)
+    except ImportError:
+        sys.exit("tkus: billing time zone %r needs Python 3.9+; remove the "
+                 "setting or upgrade Python" % name)
+    except (KeyError, ValueError, OSError):
+        # Windows has no system zone database; zoneinfo needs the package.
+        sys.exit("tkus: unknown time zone %r (on Windows, `pip install tzdata`)"
+                 % name)
+
+
+def _month_window(month: Optional[str], at: datetime, zone=timezone.utc):
+    # type: (Optional[str], datetime, ...) -> tuple
+    """(label, start, end) for a calendar month in `zone`, ending no later than
+    `at`. Start and end are returned in UTC."""
+    from datetime import timedelta
+    if month:
+        try:
+            first = datetime.strptime(month, "%Y-%m")
+        except ValueError:
+            sys.exit("tkus: --month expects YYYY-MM, got %r" % month)
+    else:
+        first = at.astimezone(zone)
+    year, mon = first.year, first.month
+    start = datetime(year, mon, 1, tzinfo=zone)
+    following = datetime(year + mon // 12, mon % 12 + 1, 1, tzinfo=zone)
+    end = min(at, following.astimezone(timezone.utc) - timedelta(microseconds=1))
+    return "%04d-%02d" % (year, mon), start.astimezone(timezone.utc), end
+
+
+def _cleanup_days() -> int:
+    home = os.environ.get("CLAUDE_CONFIG_DIR") or os.path.expanduser("~/.claude")
+    try:
+        with open(os.path.join(home, "settings.json"), "r") as fh:
+            return int(json.load(fh).get("cleanupPeriodDays") or DEFAULT_CLEANUP_DAYS)
+    except (OSError, ValueError, TypeError, AttributeError):
+        return DEFAULT_CLEANUP_DAYS
+
+
+def _billed(args) -> float:
+    if args.billed is not None:
+        return args.billed
+    missing = "tkus: pass --billed USD (the month-to-date spend /usage shows)"
+    # isatty alone is not enough: on Windows NUL is a character device.
+    if not sys.stdin.isatty():
+        sys.exit(missing)
+    try:
+        text = input("Run /usage in Claude Code; month-to-date spend in USD: ")
+    except EOFError:
+        sys.exit("\n" + missing)
+    try:
+        return float(text.strip().lstrip("$").replace(",", ""))
+    except ValueError:
+        sys.exit("tkus: not an amount: %r" % text)
+
+
+def _audit_history(path: str) -> List[dict]:
+    out = []
+    try:
+        with open(path, "r") as fh:
+            for line in fh:
+                try:
+                    out.append(json.loads(line))
+                except ValueError:
+                    continue
+    except OSError:
+        pass
+    return out
+
+
+def _jsonable(section):
+    """A reconcile() result with its datetimes rendered."""
+    out = OrderedDict()
+    for key, value in section.items():
+        out[key] = format_timestamp(value) if isinstance(value, datetime) else value
+    return out
+
+
+def cmd_audit(args) -> int:
+    """Compare every Claude Code request this month, at our rates, with the bill.
+
+    The ledger only covers repositories with tkus installed; a bill covers the
+    whole account. So this reads every project, not the ledger -- and, when the
+    telemetry receiver is set up, Claude Code's own record of each request,
+    which includes the ones transcripts never hold.
+    """
+    from datetime import timedelta
+    from . import audit, telemetry
+    from .pricing import _global_config_dir
+
+    billed = _billed(args)
+    at = now()
+    table = RateTable.load(_repo_root_or_none())
+    month, start, end = _month_window(args.month, at, _billing_zone(args, table))
+    # `since` is exclusive; step back so a request at exactly midnight counts.
+    before_start = start - timedelta(microseconds=1)
+    sessions, subagents = claude_code.ClaudeCodeProvider().collect_split(
+        None, before_start, end)
+    records = sessions + subagents
+    cost = compute_cost(records, table, when=None)
+    session_usd = compute_cost(sessions, table, when=None).total
+    subagent_usd = compute_cost(subagents, table, when=None).total
+
+    history_path = os.path.join(_global_config_dir(), AUDIT_HISTORY)
+    starts = telemetry.starts()
+    up_now = telemetry.is_up(telemetry.port()) if starts else False
+
+    # Telemetry covers only its own window: from the receiver's first start, or
+    # the month's start if that is later.
+    tele = None
+    events = []  # type: List[dict]
+    if starts:
+        tele_since = max(before_start, starts[0])
+        events = telemetry.load(tele_since, end)
+        tele = audit.reconcile(records, events, table, tele_since, end)
+
+    estimate = cost.total + (tele["hidden_usd"] if tele else 0.0)
+    difference = estimate - billed
+    percent = difference / billed * 100.0 if billed else None
+    within = (abs(percent) <= args.tolerance if percent is not None
+              else estimate == 0)
+    pruned = start < at - timedelta(days=_cleanup_days())
+
+    # Since the previous audit of this month: the billed figure moved by a known
+    # amount, and both sources can be priced over exactly that interval. This
+    # is the comparison that is fair to telemetry, which began mid-month.
+    interval = None
+    prev = audit.previous_run(_audit_history(history_path), month,
+                              format_timestamp(at))
+    if prev:
+        prev_at = parse_timestamp(prev["at"])
+        in_interval = [r for r in records if r.timestamp > prev_at]
+        gap = (audit.coverage_gap(starts, prev_at, end, up_now) if starts
+               else "telemetry is not set up")
+        interval = OrderedDict([
+            ("since", format_timestamp(prev_at)),
+            ("billed_delta", round(billed - prev["billed"], 6)),
+            ("transcripts_usd", round(compute_cost(in_interval, table).total, 6)),
+            ("telemetry_usd", None),
+            ("telemetry_gap", gap),
+        ])
+        if gap is None:
+            interval["telemetry_usd"] = audit.reconcile(
+                records, events, table, prev_at, end)["telemetry_usd"]
+
+    result = OrderedDict([
+        ("at", format_timestamp(at)),
+        ("month", month),
+        ("since", format_timestamp(start)),
+        ("until", format_timestamp(end)),
+        ("currency", cost.currency),
+        ("rates_version", cost.rates_version),
+        ("billed", billed),
+        ("transcripts", round(cost.total, 6)),
+        ("estimate", round(estimate, 6)),
+        ("sessions", OrderedDict([("reqs", len(sessions)),
+                                  ("usd", round(session_usd, 6))])),
+        ("subagents", OrderedDict([("reqs", len(subagents)),
+                                   ("usd", round(subagent_usd, 6))])),
+        ("difference", round(difference, 6)),
+        ("difference_pct", None if percent is None else round(percent, 3)),
+        ("tolerance_pct", args.tolerance),
+        ("within_tolerance", within),
+        ("unpriced", cost.unpriced_models),
+        ("may_be_pruned", pruned),
+        ("by_model", OrderedDict(
+            (model, round(usd, 6))
+            for (_, model), usd in sorted(cost.per_model.items(),
+                                          key=lambda kv: -kv[1]))),
+        ("telemetry", _jsonable(tele) if tele else None),
+        ("interval", interval),
+    ])
+
+    os.makedirs(os.path.dirname(history_path), exist_ok=True)
+    with open(history_path, "a") as fh:
+        fh.write(json.dumps(result) + "\n")
+
+    if args.json:
+        print(json.dumps(result, indent=2))
+        return 0 if within else 1
+
+    print("Claude Code usage in every project, %s to %s\n"
+          % (format_timestamp(start), format_timestamp(end)))
+    _print_table(aggregate_by_model(records), cost)
+    print()
+    print("  sessions   %6d reqs  %12s" % (len(sessions), _money(round(session_usd, 2))))
+    print("  subagents  %6d reqs  %12s" % (len(subagents), _money(round(subagent_usd, 2))))
+    print("  transcripts            %12s" % _money(round(cost.total, 2)))
+    if tele:
+        print("  hidden calls           %12s   (from telemetry, below)"
+              % _money(round(tele["hidden_usd"], 2)))
+        print("  estimate               %12s" % _money(round(estimate, 2)))
+    print("  billed                 %12s   (/usage, month to date)" % _money(billed))
+    print("  difference             %12s   %s" % (
+        _money(round(difference, 2)),
+        "n/a" if percent is None else "%+.1f%% of billed" % percent))
+
+    if tele:
+        _print_telemetry(tele, up_now)
+    if interval:
+        _print_interval(interval)
+
+    print()
+    if pruned:
+        print("warning: this month started more than %d days ago, so Claude Code "
+              "may have deleted early transcripts (cleanupPeriodDays)"
+              % _cleanup_days())
+    if not starts:
+        print("note: calls that never reach a transcript (compaction, web "
+              "fetches) are not counted; `tkus telemetry setup` captures them.")
+    print("%s: tolerance is %s%%" % ("ok" if within else "MISMATCH",
+                                     _money(args.tolerance)))
+    return 0 if within else 1
+
+
+def _print_telemetry(tele, up_now) -> None:
+    print()
+    print("Telemetry since %s%s" % (
+        format_timestamp(tele["since"]), "" if up_now else "  (receiver not running)"))
+    print("  transcripts            %12s" % _money(round(tele["transcripts_usd"], 2)))
+    print("  telemetry              %12s   %d matched, %d hidden" % (
+        _money(round(tele["telemetry_usd"], 2)), tele["matched"], tele["hidden"]))
+    for row in tele["hidden_by_source"]:
+        print("    %-20s %-22s %5d calls %10s" % (
+            row["query_source"], row["model"], row["calls"],
+            _money(round(row["usd"], 2))))
+    if tele["unreported"]:
+        print("  not in telemetry       %12s   %d requests, from sessions started "
+              "before setup or while the receiver was down" % (
+                  _money(round(tele["unreported_usd"], 2)), tele["unreported"]))
+    if tele["token_mismatches"]:
+        print("  warning: %d requests have different token counts in telemetry "
+              "and transcripts" % tele["token_mismatches"])
+    if tele["matched"]:
+        print("  Claude Code prices the matched requests at %s; tkus at %s" % (
+            _money(round(tele["claude_priced_matched_usd"], 2)),
+            _money(round(tele["matched_usd"], 2))))
+
+
+def _print_interval(interval) -> None:
+    print()
+    print("Since the last audit (%s)" % interval["since"])
+    print("  billed                 %12s" % _money(round(interval["billed_delta"], 2)))
+    print("  transcripts            %12s" % _money(round(interval["transcripts_usd"], 2)))
+    if interval["telemetry_usd"] is None:
+        print("  telemetry              %12s   %s" % ("n/a", interval["telemetry_gap"]))
+    else:
+        print("  telemetry              %12s" % _money(round(interval["telemetry_usd"], 2)))
+
+
+def cmd_telemetry(args) -> int:
+    from . import telemetry
+    if args.action == "serve":
+        telemetry.serve(args.port)
+        return 0
+    if args.action == "setup":
+        return _telemetry_setup(args)
+    return _telemetry_status()
+
+
+def _telemetry_setup(args) -> int:
+    from . import telemetry
+    path = telemetry.claude_settings_path()
+    try:
+        with open(path, "r") as fh:
+            current = json.load(fh)
+    except FileNotFoundError:
+        current = {}
+    except (OSError, ValueError) as exc:
+        sys.exit("tkus: cannot read %s: %s" % (path, exc))
+    if not isinstance(current, dict):
+        sys.exit("tkus: %s: expected a JSON object" % path)
+
+    merged, conflicts = telemetry.merged_settings(current, args.port)
+    if conflicts:
+        print("%s already sends telemetry elsewhere:" % path)
+        for key, value in conflicts:
+            print("  %s=%s" % (key, value))
+        print("Not changed. Remove these first if tkus should receive it instead.")
+        return 1
+
+    print("Claude Code settings (%s), env:" % path)
+    for key, value in sorted(telemetry.claude_env(args.port).items()):
+        print("  %s=%s" % (key, value))
+    print("Receiver: %s, started at logon (task %s)"
+          % (telemetry.endpoint(args.port), telemetry.TASK_NAME))
+    print("Stored: model, token counts, cost, request and session id, and "
+          "which subsystem made the call -- no prompts, no identity.")
+    if not args.yes:
+        print("\n(dry run; pass --yes to apply)")
+        return 0
+
+    os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+    with open(path, "w") as fh:
+        json.dump(merged, fh, indent=2)
+        fh.write("\n")
+    problem = telemetry.schedule_at_logon(args.port)
+    if problem:
+        print("warning: not started at logon: %s" % problem)
+        print("  run `%s` yourself, or at login"
+              % " ".join(telemetry.serve_command(args.port)))
+    if not telemetry.is_up(args.port):
+        telemetry.start_detached(args.port)
+    print("\nDone. Claude Code sessions started from now on send telemetry; "
+          "ones already running do not.")
+    return 0
+
+
+def _telemetry_status() -> int:
+    from . import telemetry
+    port = telemetry.port()
+    starts = telemetry.starts()
+    up = telemetry.is_up(port)
+    print("receiver: %s (%s)" % ("running" if up else "not running",
+                                  telemetry.endpoint(port)))
+    if starts:
+        print("first started: %s, last started: %s" % (
+            format_timestamp(starts[0]), format_timestamp(starts[-1])))
+    at = now()
+    month_start = at.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
+    events = telemetry.load(month_start, at)
+    requests = [e for e in events if e.get("event") == "api_request"]
+    print("this month: %d requests, %d errors" % (
+        len(requests), len(events) - len(requests)))
+    if requests:
+        print("latest: %s" % format_timestamp(max(e["at"] for e in requests)))
+    return 0 if up else 1
+
+
 def cmd_hook(args) -> int:
     handler = HOOK_DISPATCH.get(args.name)
     if handler is None:
@@ -967,7 +1308,21 @@ def _rate_rows(table, when):
                 # of any published rate, so nothing real is lost.
                 row[name] = round(value, 10)
             rows.append(row)
+            long = table.long_context(model, speed, when)
+            if long:
+                above, (inp, out), cache = long
+                row = {"model": model, "speed": speed, "above": above,
+                       "input": inp, "output": out}
+                for (name, _default), value in zip(table.CACHE_FIELDS, cache):
+                    row[name] = round(value, 10)
+                rows.append(row)
     return rows
+
+
+def _rate_label(row) -> str:
+    if "above" in row:
+        return "%s >%dk" % (row["model"], row["above"] // 1000)
+    return row["model"]
 
 
 def _scheduled_changes(table, when):
@@ -1323,7 +1678,7 @@ def cmd_rates(args) -> int:
 
     if rows:
         print("%s per 1M tokens" % table.currency)
-        mwidth = max(max(len(r["model"]) for r in rows), len("model"))
+        mwidth = max(max(len(_rate_label(r)) for r in rows), len("model"))
         swidth = max(max(len(r["speed"]) for r in rows), len("speed"))
         header = "%-*s %-*s %9s %9s %12s %12s %10s" % (
             mwidth, "model", swidth, "speed", "input", "output",
@@ -1336,7 +1691,7 @@ def cmd_rates(args) -> int:
             # 3.50 makes cache-read 0.175, and rounding that to 0.18 is a 3%
             # error on the largest token class most sessions have.
             print("%-*s %-*s %9.2f %9.2f %12s %12s %10s" % (
-                mwidth, r["model"], swidth, r["speed"], r["input"], r["output"],
+                mwidth, _rate_label(r), swidth, r["speed"], r["input"], r["output"],
                 _money(r["cache_write_1h"]), _money(r["cache_write_5m"]),
                 _money(r["cache_read"])))
         print()
@@ -1457,6 +1812,34 @@ def build_parser() -> argparse.ArgumentParser:
     rates.add_argument("--json", action="store_true",
                        help="machine-readable output")
     rates.set_defaults(func=cmd_rates)
+
+    audit = sub.add_parser(
+        "audit", help="compare this month's Claude Code usage, in every "
+                      "project, with what you were billed; exit 1 on a mismatch")
+    audit.add_argument("--billed", type=float, metavar="USD",
+                       help="month-to-date spend shown by /usage (prompted "
+                            "for when omitted)")
+    audit.add_argument("--month", metavar="YYYY-MM",
+                       help="a past month to audit (default: this month so far)")
+    audit.add_argument("--tolerance", type=float, default=5.0, metavar="PCT",
+                       help="allowed difference, percent of billed (default 5)")
+    audit.add_argument("--json", action="store_true",
+                       help="machine-readable output")
+    audit.add_argument("--tz", metavar="ZONE",
+                       help="time zone the billing month runs in, e.g. "
+                            "America/Denver (default: billing.timezone in "
+                            "config, else UTC)")
+    audit.set_defaults(func=cmd_audit)
+
+    tele = sub.add_parser(
+        "telemetry", help="receive Claude Code's telemetry, so `tkus audit` "
+                          "sees requests transcripts miss")
+    tele.add_argument("action", choices=("setup", "status", "serve"),
+                      nargs="?", default="status")
+    tele.add_argument("--port", type=int, default=4318)
+    tele.add_argument("--yes", action="store_true",
+                      help="with setup, apply the changes")
+    tele.set_defaults(func=cmd_telemetry)
 
     hook = sub.add_parser("hook", help=argparse.SUPPRESS)
     hook.add_argument("name")

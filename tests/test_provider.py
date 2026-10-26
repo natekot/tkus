@@ -145,6 +145,101 @@ class TestCwdScoping(ProviderTestCase):
         self.assertEqual(self.collect(repo), [])
 
 
+class TestStreamingLines(ProviderTestCase):
+    """Lines written while a response streams carry partial usage. On real
+    data the first line of a request held 28% fewer output tokens than the
+    last, so counting the first line undercounted output."""
+
+    def test_most_complete_line_counted(self):
+        repo = self.repo()
+        fixtures.write_project(self.projects, fixtures.encode(repo), [
+            fixtures.assistant_line("req", cwd=repo, output_tokens=8,
+                                    timestamp="2026-08-09T02:10:00.000Z"),
+            fixtures.assistant_line("req", cwd=repo, output_tokens=900,
+                                    timestamp="2026-08-09T02:10:30.000Z"),
+        ])
+        [record] = self.collect(repo)
+        self.assertEqual(record.output_tokens, 900)
+
+    def test_dated_by_first_line(self):
+        repo = self.repo()
+        fixtures.write_project(self.projects, fixtures.encode(repo), [
+            fixtures.assistant_line("req", cwd=repo, output_tokens=8,
+                                    timestamp="2026-08-09T02:10:00.000Z"),
+            fixtures.assistant_line("req", cwd=repo, output_tokens=900,
+                                    timestamp="2026-08-09T02:10:30.000Z"),
+        ])
+        [record] = self.collect(repo)
+        self.assertEqual(record.timestamp, parse_timestamp("2026-08-09T02:10:00.000Z"))
+
+    def test_request_spanning_a_commit_counted_once_with_full_usage(self):
+        """A commit between a request's first and last line used to count the
+        partial usage before it and the rest again after it."""
+        repo = self.repo()
+        fixtures.write_project(self.projects, fixtures.encode(repo), [
+            fixtures.assistant_line("req", cwd=repo, output_tokens=8,
+                                    timestamp="2026-08-09T02:10:00.000Z"),
+            fixtures.assistant_line("req", cwd=repo, output_tokens=900,
+                                    timestamp="2026-08-09T02:10:30.000Z"),
+        ])
+        commit = parse_timestamp("2026-08-09T02:10:15.000Z")
+        [before] = self.collect(repo, until=commit)
+        self.assertEqual(before.output_tokens, 900)
+        self.assertEqual(self.collect(repo, since=commit), [])
+
+
+class TestSubagents(ProviderTestCase):
+    def test_subagent_transcripts_are_collected(self):
+        """Subagents write <session>/subagents/*.jsonl and their requests are
+        not repeated in the session file -- on real data about 30% of cost."""
+        repo = self.repo()
+        encoded = fixtures.encode(repo)
+        fixtures.write_project(self.projects, encoded, [
+            fixtures.assistant_line("main", cwd=repo, output_tokens=1),
+        ])
+        fixtures.write_subagent(self.projects, encoded, [
+            fixtures.assistant_line("agent", cwd=repo, output_tokens=2),
+        ])
+        ids = sorted(r.request_id for r in self.collect(repo))
+        self.assertEqual(ids, ["agent", "main"])
+
+    def test_split_keeps_sessions_and_subagents_apart(self):
+        repo = self.repo()
+        encoded = fixtures.encode(repo)
+        fixtures.write_project(self.projects, encoded, [
+            fixtures.assistant_line("main", cwd=repo),
+        ])
+        fixtures.write_subagent(self.projects, encoded, [
+            fixtures.assistant_line("agent", cwd=repo),
+        ])
+        sessions, subagents = self.provider.collect_split(repo, None, FAR_FUTURE)
+        self.assertEqual([r.request_id for r in sessions], ["main"])
+        self.assertEqual([r.request_id for r in subagents], ["agent"])
+
+    def test_request_in_both_counted_once(self):
+        repo = self.repo()
+        encoded = fixtures.encode(repo)
+        fixtures.write_project(self.projects, encoded, [
+            fixtures.assistant_line("same", cwd=repo, output_tokens=5),
+        ])
+        fixtures.write_subagent(self.projects, encoded, [
+            fixtures.assistant_line("same", cwd=repo, output_tokens=5),
+        ])
+        self.assertEqual(len(self.collect(repo)), 1)
+
+    def test_no_repo_root_collects_every_project(self):
+        """The whole account, as a bill sees it -- no cwd check at all."""
+        alpha, beta = self.repo("alpha"), self.repo("beta")
+        fixtures.write_project(self.projects, fixtures.encode(alpha), [
+            fixtures.assistant_line("a", cwd=alpha),
+        ])
+        fixtures.write_project(self.projects, fixtures.encode(beta), [
+            fixtures.assistant_line("b", cwd="/somewhere/else"),
+        ])
+        ids = sorted(r.request_id for r in self.collect(None))
+        self.assertEqual(ids, ["a", "b"])
+
+
 class TestWindow(ProviderTestCase):
     def test_since_is_exclusive_and_until_inclusive(self):
         """The cursor is the end of an already-attributed window, so a record
