@@ -398,6 +398,7 @@ transcript store.
 | `tkus tag [<name>] [--undo]` | File the usage since the last commit under a name instead of a branch |
 | `tkus reprice` | Re-price the ledger with the current rate table |
 | `tkus reprice --fill [--yes]` | Price rows recorded before their model had a rate |
+| `tkus reprice --recollect [--yes]` | Re-read entries from the transcripts, adding subagent usage |
 | `tkus show [<commit>]` | Per-commit detail from the local `.git/` ledger |
 | `tkus rates [--at DATE] [--json]` | The rate table used for pricing |
 | `tkus rates --check` | Compare against the installed Claude Code; exit 1 on drift |
@@ -616,6 +617,48 @@ A ledger row records no speed, so a filled row is priced at the standard rate,
 the same way `tkus reprice` prices everything. Fast-mode usage of a model that
 had no rate is understated by the difference.
 
+### Re-reading entries recorded before the fixes
+
+Entries recorded before 2026-10 left out subagent usage and counted each
+request from a partial line (see [Cost accuracy](#claude-code)). How much they
+left out depends on how much each commit's work used subagents, so no flat
+correction is right. While the transcripts are still on disk, `--recollect`
+re-reads each entry's window with the current collection:
+
+```
+$ tkus reprice --recollect
+.tkus/nate-kot/SCSW-5133-test-servo.jsonl
+  2026-10-19   14.388834 ->  55.898301      +41.51
+...
+19 entries: 222.54 -> 373.86 USD (+151.32)
+left as recorded: 29, not reproduced (transcripts pruned, or an older tkus)
+dry run. Re-run with --yes to write it.
+```
+
+An entry records its window but not the worktree it was committed from, and
+worktrees' windows overlap. So the old collection is replayed for every place
+the commit could have run: each worktree, and each directory a session ran in,
+which also finds worktrees since deleted. An entry is rewritten only when the
+places that reproduce it **to the token** agree on the new figure. Everything
+else is left as recorded:
+
+- **Not reproduced.** Claude Code deletes transcripts after
+  `cleanupPeriodDays` (30 by default), and re-reading a partial window would
+  lower the entry instead of correcting it. Entries from another machine, or
+  recorded by a tkus older than the token fields it compares, land here too.
+- **Ambiguous.** More than one place reproduces the entry but would re-read it
+  differently, which happens to entries with no Claude Code usage of their own.
+
+Requests that never reached a transcript (compaction, web fetch and search
+sub-calls) cannot be recovered; only [telemetry](#requests-the-transcripts-never-record)
+sees those, and only from when it was set up.
+
+With `--yes` the entries are rewritten, marked `"recollected": true`, and
+staged, as with `--fill`. They are priced with the current rate table, at the
+rates that applied on their dates. Until your next commit takes them, they are
+also kept in `.git/tkus/replacements.jsonl`, because that commit rebuilds its
+branch's file from `HEAD`, where the old entries still are.
+
 ### Reading does not require installing
 
 `tkus report` works in **any** git repository, whether or not `tkus install` has
@@ -718,8 +761,10 @@ The figure is designed to be reconcilable against a real invoice.
 - **Subagent usage is counted.** Each subagent writes its own transcript under
   `<session>/subagents/`, and its requests do not appear in the session's own
   file. Before 2026-10 these files were not read, and on real data they held
-  about 30% of the cost. Ledger entries recorded before then are low by that
-  share. They are not rewritten.
+  about 30% of the cost. Ledger entries recorded before then are low by an
+  amount that varies per commit;
+  [`tkus reprice --recollect`](#re-reading-entries-recorded-before-the-fixes)
+  corrects the ones whose transcripts are still on disk.
 - **Each request is counted with its final usage.** A response is written as
   several lines, and the lines written while it streams carry partial counts.
   Before 2026-10 the first line was used, which on real data undercounted

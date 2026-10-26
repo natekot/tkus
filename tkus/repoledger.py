@@ -327,6 +327,7 @@ def write_entry(repo_root, entry, rel_path=None, table=None):
                                if entry_key(e) not in drop])
     if table is not None:
         entries = [ledger.fill_unpriced(e, table) or e for e in entries]
+    entries = apply_replacements(repo_root, entries)
     if entry is not None:
         entries.append(entry)
 
@@ -340,6 +341,42 @@ def write_entry(repo_root, entry, rel_path=None, table=None):
         except OSError:
             pass
     return rel, stale
+
+
+# Entries `tkus reprice --recollect` staged, until a commit takes them. HEAD
+# still holds the old ones, and every commit rebuilds its branch's file from
+# HEAD, so without this the next commit would quietly undo them.
+REPLACEMENTS_FILE = "replacements.jsonl"
+
+
+def stage_replacements(repo_root, entries):
+    # type: (str, List[dict]) -> None
+    path = os.path.join(cursor.state_dir(repo_root), REPLACEMENTS_FILE)
+    with open(path, "a", newline="\n") as fh:
+        for item in entries:
+            fh.write(json.dumps(item, sort_keys=True) + "\n")
+
+
+def apply_replacements(repo_root, entries):
+    # type: (str, List[dict]) -> List[dict]
+    path = os.path.join(cursor.state_dir(repo_root, create=False), REPLACEMENTS_FILE)
+    try:
+        with open(path, "r", errors="replace") as fh:
+            staged = _parse(fh.read())
+    except OSError:
+        return entries
+    by_key = {entry_key(e): e for e in staged}
+    by_key.pop(None, None)
+    return [by_key.get(entry_key(e), e) for e in entries]
+
+
+def clear_replacements(repo_root):
+    # type: (str) -> None
+    """Called from post-commit: the commit holds them now."""
+    try:
+        os.remove(os.path.join(cursor.state_dir(repo_root, create=False), REPLACEMENTS_FILE))
+    except OSError:
+        pass
 
 
 def rewrite(repo_root, rel, entries):

@@ -226,6 +226,7 @@ def hook_post_commit(root: str, argv: List[str]) -> int:
     """Advance the cursor, and file the per-SHA detail locally."""
     detail = (cursor_mod.read_pending(root) or {}).get("detail")
     cursor_mod.promote_pending(root)
+    repoledger.clear_replacements(root)
     if detail:
         sha = head_sha(root)
         if sha:
@@ -798,8 +799,12 @@ def cmd_reprice(args) -> int:
     """
     root = repo_root()
     table = RateTable.load(root)
+    if args.fill and args.recollect:
+        sys.exit("tkus: use --fill or --recollect, not both")
     if args.fill:
         return _fill_unpriced(root, table, args.yes)
+    if args.recollect:
+        return _recollect(root, table, args.yes)
 
     grand_old = grand_new = 0.0
     rows = fillable = 0
@@ -884,6 +889,66 @@ def _fill_unpriced(root, table, write):
         return 0
     for rel, entries in changed:
         repoledger.rewrite(root, rel, entries)
+    print("staged; it lands in your next commit")
+    return 0
+
+
+def _recollect(root, table, write):
+    # type: (str, RateTable, bool) -> int
+    """Re-read ledger entries from the transcripts still on disk.
+
+    Every identity's files, like --fill: an entry is only rewritten when this
+    machine's transcripts reproduce it to the token, so another machine's
+    entries are left alone without needing to know whose they are.
+    """
+    from . import recollect
+    transcripts = recollect.Transcripts(recollect.worktrees(root))
+    changed = []
+    skipped = OrderedDict()  # type: Dict[str, int]
+    before = after = 0.0
+    currency = table.currency
+    for rel in repoledger.all_files(root):
+        entries = repoledger.read_committed(root, rel)
+        rows = []
+        for i, entry in enumerate(entries):
+            new, why = recollect.reread(entry, transcripts, table)
+            if why:
+                skipped[why] = skipped.get(why, 0) + 1
+            if new is None:
+                continue
+            entries[i] = new
+            rows.append((entry, new))
+            before += float(entry.get("usd") or 0.0)
+            after += new["usd"]
+            currency = entry.get("currency", currency)
+        if not rows:
+            continue
+        changed.append((rel, entries, [new for _, new in rows]))
+        print(rel)
+        for old, new in rows:
+            print("  %s  %10s -> %10s  %+10.2f" % (
+                (old.get("until") or old.get("at") or "")[:10],
+                _money(float(old.get("usd") or 0.0)), _money(new["usd"]),
+                new["usd"] - float(old.get("usd") or 0.0)))
+
+    if changed:
+        count = sum(len(new) for _, _, new in changed)
+        print("\n%d entr%s: %.2f -> %.2f %s (%+.2f)" % (
+            count, "y" if count == 1 else "ies", before, after, currency,
+            after - before))
+    for why, count in skipped.items():
+        print("left as recorded: %d, %s" % (count, why))
+    if not changed:
+        print("nothing to re-read: every entry the transcripts reproduce "
+              "is already complete")
+        return 0
+    if not write:
+        print("dry run. Re-run with --yes to write it.")
+        return 0
+    for rel, entries, _ in changed:
+        repoledger.rewrite(root, rel, entries)
+    repoledger.stage_replacements(
+        root, [new for _, _, rows in changed for new in rows])
     print("staged; it lands in your next commit")
     return 0
 
@@ -1790,8 +1855,13 @@ def build_parser() -> argparse.ArgumentParser:
     reprice.add_argument("--fill", action="store_true",
                          help="price rows recorded before their model had a "
                               "rate; a dry run unless --yes is given")
+    reprice.add_argument("--recollect", action="store_true",
+                         help="re-read entries from the transcripts, adding "
+                              "subagent usage and final streaming totals; a "
+                              "dry run unless --yes is given")
     reprice.add_argument("--yes", action="store_true",
-                         help="with --fill, rewrite and stage the ledger files")
+                         help="with --fill or --recollect, rewrite and stage "
+                              "the ledger files")
     reprice.set_defaults(func=cmd_reprice)
 
     show = sub.add_parser("show", help="per-commit detail from the local ledger")
