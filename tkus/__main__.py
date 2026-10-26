@@ -1300,7 +1300,7 @@ def _telemetry_setup(args) -> int:
         print("warning: not started at logon: %s" % problem)
         print("  run `%s` yourself, or at login"
               % " ".join(telemetry.serve_command(args.port)))
-    if not telemetry.is_up(args.port):
+    if not telemetry.is_up(args.port) and (problem or not telemetry.run_task()):
         telemetry.start_detached(args.port)
     print("\nDone. Claude Code sessions started from now on send telemetry; "
           "ones already running do not.")
@@ -1325,6 +1325,9 @@ def _telemetry_status() -> int:
         len(requests), len(events) - len(requests)))
     if requests:
         print("latest: %s" % format_timestamp(max(e["at"] for e in requests)))
+    if not up:
+        print("start it with `tkus telemetry setup --yes`; Claude Code sessions "
+              "drop their telemetry while it is down")
     return 0 if up else 1
 
 

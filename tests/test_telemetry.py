@@ -144,6 +144,11 @@ class TestServer(ConfigHome):
     def test_health(self):
         self.assertTrue(telemetry.is_up(self.port))
 
+    def test_second_receiver_steps_aside(self):
+        """Logon can start one while `setup` already has: the second must
+        succeed, or the task restarts it every minute."""
+        self.assertIsNone(telemetry.serve(self.port))
+
 
 class TestLoad(ConfigHome):
     def test_window_and_duplicates(self):
@@ -174,6 +179,42 @@ class TestSetup(unittest.TestCase):
     def test_rerunning_setup_is_not_a_conflict(self):
         merged, _ = telemetry.merged_settings({})
         self.assertEqual(telemetry.merged_settings(merged)[1], [])
+
+
+class TestLogonTask(unittest.TestCase):
+    """`schtasks /sc onlogon` defaults stop the receiver on battery and after
+    72 hours; the XML has to turn each of them off."""
+
+    def settings(self):
+        import xml.etree.ElementTree as ET
+        text = telemetry.task_xml(["C:\py\pythonw.exe", "-m", "tkus",
+                                   "telemetry", "serve"], "DOM\me & co")
+        root = ET.fromstring(text.split("?>", 1)[1])
+        ns = {"t": "http://schemas.microsoft.com/windows/2004/02/mit/task"}
+        return root, ns
+
+    def test_runs_on_battery_and_forever(self):
+        root, ns = self.settings()
+        get = lambda path: root.find("t:Settings/t:" + path, ns).text
+        self.assertEqual(get("DisallowStartIfOnBatteries"), "false")
+        self.assertEqual(get("StopIfGoingOnBatteries"), "false")
+        self.assertEqual(get("ExecutionTimeLimit"), "PT0S")
+        self.assertEqual(get("IdleSettings/t:StopOnIdleEnd"), "false")
+        self.assertEqual(get("MultipleInstancesPolicy"), "IgnoreNew")
+
+    def test_restarted_after_dying(self):
+        root, ns = self.settings()
+        self.assertEqual(root.find(
+            "t:Triggers/t:TimeTrigger/t:Repetition/t:Interval", ns).text, "PT5M")
+
+    def test_command_and_user(self):
+        root, ns = self.settings()
+        self.assertEqual(root.find("t:Actions/t:Exec/t:Command", ns).text,
+                         "C:\py\pythonw.exe")
+        self.assertEqual(root.find("t:Actions/t:Exec/t:Arguments", ns).text,
+                         "-m tkus telemetry serve")
+        self.assertEqual(root.find("t:Triggers/t:LogonTrigger/t:UserId", ns).text,
+                         "DOM\me & co")
 
 
 def record(request_id, output_tokens=1000, at=AT):

@@ -39,6 +39,8 @@ commit time from data that is already there.
 - [Configuration](#configuration)
 - [How attribution works](#how-attribution-works)
 - [Cost accuracy](#cost-accuracy)
+  - [Checking against your bill](#checking-against-your-bill)
+  - [Claude Code telemetry](#requests-the-transcripts-never-record)
 - [Privacy](#privacy)
 - [Troubleshooting](#troubleshooting)
 - [Known limitations](#known-limitations)
@@ -860,18 +862,41 @@ tkus telemetry status
 
 `setup` does three things:
 
-- adds four `OTEL_*` / `CLAUDE_CODE_ENABLE_TELEMETRY` variables to the `env`
-  block of `~/.claude/settings.json`. It refuses if telemetry already goes
-  somewhere else, such as an organization collector;
-- registers a receiver on `127.0.0.1:4318` that starts at logon;
+- adds these to the `env` block of `~/.claude/settings.json`, which you can
+  also do by hand:
+
+  ```json
+  "env": {
+    "CLAUDE_CODE_ENABLE_TELEMETRY": "1",
+    "OTEL_LOGS_EXPORTER": "otlp",
+    "OTEL_EXPORTER_OTLP_LOGS_PROTOCOL": "http/json",
+    "OTEL_EXPORTER_OTLP_LOGS_ENDPOINT": "http://127.0.0.1:4318/v1/logs"
+  }
+  ```
+
+  It refuses if telemetry already goes somewhere else, such as an
+  organization collector. Claude Code sends to one endpoint per signal, so
+  tkus and a collector cannot both receive the events;
+- registers a receiver on `127.0.0.1:4318` that starts at logon, keeps
+  running on battery, and is started again within five minutes if it stops;
 - starts the receiver.
 
-Only Claude Code sessions started afterwards send telemetry.
+Only Claude Code sessions started afterwards send telemetry. To check that
+they do, note the `latest:` time in `tkus telemetry status`, make one request
+in a session, and run it again: the time should move to just now. If it does
+not, the session predates setup; restart it. While the
+receiver is down, sessions drop theirs, and `tkus audit` reports the gap.
+`tkus telemetry status` says whether it is running. Running `setup --yes`
+again is safe, and is how a receiver registered by tkus before 0.14.1 gets
+these settings: until then, Task Scheduler's defaults stopped it on battery
+and after 72 hours.
 
 The receiver keeps model, token counts, Claude Code's price, request and
 session ids, and which subsystem made the call (`query_source`, e.g. `compact`).
 Each event also carries your email and account ids; those are dropped. Events
 are kept in `~/.config/tkus/telemetry/`.
+
+Only Claude Code's telemetry is received; Copilot's is not.
 
 With telemetry present, `tkus audit` adds:
 

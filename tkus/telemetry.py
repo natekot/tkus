@@ -20,8 +20,10 @@ import gzip
 import json
 import os
 import shutil
+import socket
 import subprocess
 import sys
+import tempfile
 import threading
 from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -269,12 +271,33 @@ class Handler(BaseHTTPRequestHandler):
         pass  # runs headless; a log line per export would only grow a file
 
 
+class _Server(ThreadingHTTPServer):
+    """Owns its port outright. HTTPServer sets SO_REUSEADDR, which on Windows
+    lets a second receiver bind a port the first is listening on -- both then
+    run, and each gets some of the requests."""
+
+    allow_reuse_address = os.name != "nt"
+
+    def server_bind(self):
+        if os.name == "nt":
+            self.socket.setsockopt(socket.SOL_SOCKET, socket.SO_EXCLUSIVEADDRUSE, 1)
+        super().server_bind()
+
+
 def make_server(port: int = DEFAULT_PORT) -> ThreadingHTTPServer:
-    return ThreadingHTTPServer((HOST, port), Handler)
+    return _Server((HOST, port), Handler)
 
 
 def serve(port: int = DEFAULT_PORT) -> None:
-    server = make_server(port)
+    try:
+        server = make_server(port)
+    except OSError:
+        # Another receiver already has the port -- one `setup` started, say,
+        # before logon started this one. Succeed, so the task does not keep
+        # restarting it; fail for anything else on the port.
+        if is_up(port):
+            return
+        raise
     os.makedirs(directory(), exist_ok=True)
     with open(_receiver_log(), "a") as fh:
         fh.write(json.dumps({"kind": "start", "at": format_timestamp(
@@ -335,14 +358,95 @@ def schedule_at_logon(port: int = DEFAULT_PORT) -> Optional[str]:
         return "automatic start is only set up on Windows"
     if not shutil.which("schtasks"):
         return "schtasks not found"
-    command = subprocess.list2cmdline(serve_command(port))
-    result = subprocess.run(
-        ["schtasks", "/create", "/tn", TASK_NAME, "/sc", "onlogon",
-         "/tr", command, "/f"],
-        stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+    domain, name = os.environ.get("USERDOMAIN"), os.environ.get("USERNAME", "")
+    user = "%s\\%s" % (domain, name) if domain else name
+    handle, path = tempfile.mkstemp(suffix=".xml")
+    os.close(handle)
+    try:
+        # schtasks reads the XML as the encoding it declares, UTF-16.
+        with open(path, "w", encoding="utf-16") as fh:
+            fh.write(task_xml(serve_command(port), user))
+        result = subprocess.run(
+            ["schtasks", "/create", "/tn", TASK_NAME, "/xml", path, "/f"],
+            stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+    finally:
+        os.remove(path)
     if result.returncode != 0:
         return result.stdout.decode(errors="replace").strip()
     return None
+
+
+def task_xml(command, user):
+    # type: (List[str], str) -> str
+    """The logon task, as Task Scheduler XML.
+
+    `schtasks /create /sc onlogon` takes Task Scheduler's defaults, and three
+    of them stop a receiver meant to run all session: it is killed when a
+    laptop goes on battery, is not started on battery, and is killed after 72
+    hours. The receiver died within a day that way. XML is the only way
+    schtasks sets them.
+
+    A receiver that dies anyway is started again within five minutes by a
+    repeating trigger; while one runs, IgnoreNew makes those starts no-ops.
+    RestartOnFailure cannot do this: it retries only a launch that failed,
+    not a process that exited.
+    """
+    from xml.sax.saxutils import escape
+    return """<?xml version="1.0" encoding="UTF-16"?>
+<Task version="1.2" xmlns="http://schemas.microsoft.com/windows/2004/02/mit/task">
+  <RegistrationInfo>
+    <Description>tkus: receives Claude Code telemetry for `tkus audit`</Description>
+  </RegistrationInfo>
+  <Triggers>
+    <LogonTrigger>
+      <Enabled>true</Enabled>
+      <UserId>{user}</UserId>
+    </LogonTrigger>
+    <TimeTrigger>
+      <Enabled>true</Enabled>
+      <StartBoundary>2026-01-01T00:00:00</StartBoundary>
+      <Repetition>
+        <Interval>PT5M</Interval>
+        <StopAtDurationEnd>false</StopAtDurationEnd>
+      </Repetition>
+    </TimeTrigger>
+  </Triggers>
+  <Principals>
+    <Principal id="Author">
+      <UserId>{user}</UserId>
+      <LogonType>InteractiveToken</LogonType>
+      <RunLevel>LeastPrivilege</RunLevel>
+    </Principal>
+  </Principals>
+  <Settings>
+    <MultipleInstancesPolicy>IgnoreNew</MultipleInstancesPolicy>
+    <DisallowStartIfOnBatteries>false</DisallowStartIfOnBatteries>
+    <StopIfGoingOnBatteries>false</StopIfGoingOnBatteries>
+    <ExecutionTimeLimit>PT0S</ExecutionTimeLimit>
+    <IdleSettings>
+      <StopOnIdleEnd>false</StopOnIdleEnd>
+      <RestartOnIdle>false</RestartOnIdle>
+    </IdleSettings>
+    <StartWhenAvailable>true</StartWhenAvailable>
+  </Settings>
+  <Actions Context="Author">
+    <Exec>
+      <Command>{command}</Command>
+      <Arguments>{arguments}</Arguments>
+    </Exec>
+  </Actions>
+</Task>
+""".format(user=escape(user), command=escape(command[0]),
+           arguments=escape(subprocess.list2cmdline(command[1:])))
+
+
+def run_task() -> bool:
+    """Start the logon task now, so the task owns the receiver and restarts it."""
+    if os.name != "nt" or not shutil.which("schtasks"):
+        return False
+    result = subprocess.run(["schtasks", "/run", "/tn", TASK_NAME],
+                            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    return result.returncode == 0
 
 
 def start_detached(port: int = DEFAULT_PORT) -> None:
